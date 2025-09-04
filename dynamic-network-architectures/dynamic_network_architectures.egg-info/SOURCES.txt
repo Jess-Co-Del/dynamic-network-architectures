@@ -1,0 +1,5 @@
+setup.py
+dynamic_network_architectures.egg-info/PKG-INFO
+dynamic_network_architectures.egg-info/SOURCES.txt
+dynamic_network_architectures.egg-info/dependency_links.txt
+dynamic_network_architectures.egg-info/top_level.txt
