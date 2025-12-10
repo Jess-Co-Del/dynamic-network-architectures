@@ -15,6 +15,86 @@ def conv_relu(conv_op: nn.Conv2d, in_channels: int , out_channels: int , kernel:
         nn.ReLU(inplace=True),
     )
 
+class CondConvDropoutNormReLU(nn.Module):
+    def __init__(self,
+                 conv_op: Type[_ConvNd],
+                 input_channels: int,
+                 output_channels: int,
+                 kernel_size: Union[int, List[int], Tuple[int, ...]],
+                 stride: Union[int, List[int], Tuple[int, ...]],
+                 conv_bias: bool = False,
+                 norm_op: Union[None, Type[nn.Module]] = None,
+                 norm_op_kwargs: dict = None,
+                 dropout_op: Union[None, Type[_DropoutNd]] = None,
+                 dropout_op_kwargs: dict = None,
+                 nonlin: Union[None, Type[torch.nn.Module]] = None,
+                 nonlin_kwargs: dict = None,
+                 nonlin_first: bool = False,
+                 time_embedding_dim: int = 512
+                 ):
+        super(CondConvDropoutNormReLU, self).__init__()
+        self.input_channels = input_channels
+        self.output_channels = output_channels
+        stride = maybe_convert_scalar_to_list(conv_op, stride)
+        self.stride = stride
+
+        kernel_size = maybe_convert_scalar_to_list(conv_op, kernel_size)
+        if norm_op_kwargs is None:
+            norm_op_kwargs = {}
+        if nonlin_kwargs is None:
+            nonlin_kwargs = {}
+
+        ops = []
+
+        self.conv = conv_op(
+            input_channels,
+            output_channels,
+            kernel_size,
+            stride,
+            padding=[(i - 1) // 2 for i in kernel_size],
+            dilation=1,
+            bias=conv_bias,
+        )
+        ops.append(self.conv)
+
+        if dropout_op is not None:
+            self.dropout = dropout_op(**dropout_op_kwargs)
+            ops.append(self.dropout)
+
+        if norm_op is not None:
+            self.norm = norm_op(output_channels, **norm_op_kwargs)
+            ops.append(self.norm)
+
+        if nonlin is not None:
+            self.nonlin = nonlin(**nonlin_kwargs)
+            ops.append(self.nonlin)
+
+        if nonlin_first and (norm_op is not None and nonlin is not None):
+            ops[-1], ops[-2] = ops[-2], ops[-1]
+
+        self.all_modules = nn.Sequential(*ops)
+
+        self.temb_fc = nn.Linear(time_embedding_dim, output_channels)
+
+    def forward(self, x: torch.Tensor, tembed: torch.Tensor = None):
+        x = self.all_modules(x)
+
+        if tembed is not None:
+            tembed = self.temb_fc(tembed)
+            # make dimensions match in 2D or 3D case
+            for _ in range(len(x.shape)-len(tembed.shape)):
+                tembed = torch.unsqueeze(tembed, axis=-1)
+            x += tembed
+        return x
+
+    def compute_conv_feature_map_size(self, input_size):
+        assert len(input_size) == len(self.stride), "just give the image size without color/feature channels or " \
+                                                    "batch channel. Do not give input_size=(b, c, x, y(, z)). " \
+                                                    "Give input_size=(x, y(, z))!"
+        output_size = [i // j for i, j in zip(input_size, self.stride)]  # we always do same padding
+        return np.prod([self.output_channels, *output_size], dtype=np.int64)
+
+
 class ConvDropoutNormReLU(nn.Module):
     def __init__(self,
                  conv_op: Type[_ConvNd],
@@ -100,7 +180,9 @@ class StackedConvBlocks(nn.Module):
         dropout_op_kwargs: dict = None,
         nonlin: Union[None, Type[torch.nn.Module]] = None,
         nonlin_kwargs: dict = None,
-        nonlin_first: bool = False
+        nonlin_first: bool = False,
+        time_embedding_dim: int = 512,
+        block: Union[ConvDropoutNormReLU, CondConvDropoutNormReLU] = ConvDropoutNormReLU,
     ):
         """
 
@@ -123,25 +205,41 @@ class StackedConvBlocks(nn.Module):
         if not isinstance(output_channels, (tuple, list)):
             output_channels = [output_channels] * num_convs
 
-        self.convs = nn.Sequential(
-            ConvDropoutNormReLU(
-                conv_op, input_channels, output_channels[0], kernel_size, initial_stride, conv_bias, norm_op,
-                norm_op_kwargs, dropout_op, dropout_op_kwargs, nonlin, nonlin_kwargs, nonlin_first
-            ),
-            *[
-                ConvDropoutNormReLU(
-                    conv_op, output_channels[i - 1], output_channels[i], kernel_size, 1, conv_bias, norm_op,
-                    norm_op_kwargs, dropout_op, dropout_op_kwargs, nonlin, nonlin_kwargs, nonlin_first
-                )
-                for i in range(1, num_convs)
-            ]
-        )
+        if block == ConvDropoutNormReLU:
+            self.convs = nn.Sequential(
+                block(
+                    conv_op, input_channels, output_channels[0], kernel_size, initial_stride, conv_bias, norm_op,
+                    norm_op_kwargs, dropout_op, dropout_op_kwargs, nonlin, nonlin_kwargs, nonlin_first),
+                *[
+                    block(
+                        conv_op, output_channels[i - 1], output_channels[i], kernel_size, 1, conv_bias, norm_op,
+                        norm_op_kwargs, dropout_op, dropout_op_kwargs, nonlin, nonlin_kwargs, nonlin_first
+                    ) for i in range(1, num_convs)
+                ]
+            )
+        else:  # block == CondConvDropoutNormReLU
+            self.convs = nn.ModuleList([
+                block(
+                    conv_op, input_channels, output_channels[0], kernel_size, initial_stride, conv_bias, norm_op,
+                    norm_op_kwargs, dropout_op, dropout_op_kwargs, nonlin, nonlin_kwargs, nonlin_first, time_embedding_dim),
+                *[
+                    block(
+                        conv_op, output_channels[i - 1], output_channels[i], kernel_size, 1, conv_bias, norm_op,
+                        norm_op_kwargs, dropout_op, dropout_op_kwargs, nonlin, nonlin_kwargs, nonlin_first, time_embedding_dim
+                    ) for i in range(1, num_convs)
+                ]]
+            )
 
         self.output_channels = output_channels[-1]
         self.initial_stride = maybe_convert_scalar_to_list(conv_op, initial_stride)
 
-    def forward(self, x):
-        return self.convs(x)
+    def forward(self, x: torch.Tensor, tembed: torch.Tensor = None):
+        if tembed is not None:
+            for c in range(len(self.convs)):
+                x = self.convs[c](x, tembed)
+            return x
+        else:
+            return self.convs(x)
 
     def compute_conv_feature_map_size(self, input_size):
         assert len(input_size) == len(self.initial_stride), "just give the image size without color/feature channels or " \
