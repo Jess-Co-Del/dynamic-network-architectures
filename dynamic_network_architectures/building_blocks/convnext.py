@@ -164,20 +164,20 @@ class ConvNextDecoderBlock(nn.Module):
 class ConvNextEncoder(nn.Module):
     """
     Standard ConvNeXt model taken from 
-    "Liu, Zhuang, et al. "A convnet for the 2020s." Proceedings of the IEEE/CVF conference on computer vision and pattern recognition. 2022."
-    
+    "Liu, Zhuang, et al. "A convnet for the 2020s." Proceedings of
+    the IEEE/CVF conference on computer vision and pattern recognition. 2022."
     """
     def __init__(
         self,
         input_channels: int = 3, num_classes: int = 1000, dim_resolution: int = 2,
         conv_op: nn.Module = nn.Conv2d, norm_op: nn.Module = LayerNorm,
         depths= [3,3,9,3], dims = [96, 192, 384, 768], drop_path_rate: int = 0.,
-        layer_scale_init_value:int  = 1e-6, head_init_scale: int = 1.,
+        layer_scale_init_value:int  = 1e-6, head_init_scale: int = 1., embed_dim: int = None
         ) -> None:
         
 
         super(ConvNextEncoder, self).__init__()
-        
+        self.embed_dim = embed_dim
         #Stem operation and 3 downsampling layers
         self.downsample_layers = nn.ModuleList() 
 
@@ -214,31 +214,36 @@ class ConvNextEncoder(nn.Module):
                     dim=dims[i], drop_path=dp_rates[current+j],
                 layer_scale_init_value=layer_scale_init_value) for j in range(depths[i])]
             )
-        
+
             self.stages.append(stage)
             current += depths[i]
 
         # This is the standard layer normalization for the last layer
         self.norm = nn.LayerNorm(dims[-1], eps = 1e-6)
-        self.head = nn.Linear(dims[-1], 1000)
+        if embed_dim is not None:
+            self.head = nn.Linear(dims[-1], embed_dim)
+            self.head.weight.data.mul_(head_init_scale)
+            self.head.bias.data.mul_(head_init_scale)
 
         self.apply(self._init_weights)
-        self.head.weight.data.mul_(head_init_scale)
-        self.head.bias.data.mul_(head_init_scale)
 
     def _init_weights(self, m) -> None:
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
+        if isinstance(m, (nn.Conv3d, nn.Conv2d, nn.Linear)):
             trunc_normal_(m.weight, std=.02)
             nn.init.constant_(m.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        
-        for i in range(self.depths):
-            x = self.downsample_layers[i](x)
-            x = self.stages[i](x)
-        
-        x = self.head(x)
-        return x
+        skips = []
+
+        for dsl, stage in zip(self.downsample_layers, self.stages):
+            x = dsl(x)
+            x = stage(x)
+            skips.append(x)
+
+        if self.embed_dim is not None:
+            x = self.head(x)
+
+        return skips
 
 
 weight_urls = {

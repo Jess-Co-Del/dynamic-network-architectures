@@ -349,7 +349,7 @@ class ConvNextVisionDecoder(nn.Module):
   def __init__(
     self,
     conv_op: nn.Conv2d,
-    features: list = [512,256,128],
+    features: list = [512, 256, 128],
     out_channels: int = 3,
     deep_supervision: bool = False
     ):
@@ -368,22 +368,23 @@ class ConvNextVisionDecoder(nn.Module):
     attention_fusion = []
     decoderblocks = []
     seg_layers = []
-    for feature in features:
-      pointwise.append(conv_relu(conv_op, feature,feature,1,0))
+    for idx in range(len(features) -1):
+      nf = features[idx]
       upsample.append(
           transpconv_op(
-              feature*2, feature, kernel_size = 2, stride = 2,
+              nf, nf, kernel_size = 2, stride = 2,
           )
       )
       attention_fusion.append(DualPathResponseFusionAttention(
         conv_op=conv_op,
-        F_g = feature, F_l = feature, F_int = feature))
+        F_g = features[idx+1], F_l = nf, F_int = nf))
+
       decoderblocks.append(ConvNextDecoderBlock(
         conv_op=conv_op,
-        input_dim=feature*2,
-        output_dim=feature,
+        input_dim=nf*2,
+        output_dim=nf,
         stride=1, padding=1))
-      seg_layers.append(conv_op(feature, out_channels, 1,1, bias=True))
+      seg_layers.append(conv_op(nf, out_channels, 1,1, bias=True))
 
     self.pwconv = nn.ModuleList(pointwise)
     self.ups = nn.ModuleList(upsample)
@@ -395,15 +396,16 @@ class ConvNextVisionDecoder(nn.Module):
     for n in range(2):
       resolution_up.append(
         transpconv_op(
-          features[-1]//(n+1), features[-1]//(n+2), kernel_size=2, stride = 2,
+          features[-(n+1)]*2, features[-(n+1)], kernel_size=2, stride = 2,
       ))
       resolution_up.append(
         conv_op(
-          features[-1]//(n+2), features[-1]//(n+2), kernel_size=1, stride = 1,
+          features[-(n+1)], features[-(n+2)]*2, kernel_size=1, stride = 1,
       ))
-      seg_layers.append(conv_op(features[-1]//(n+2), out_channels, 1,1, bias=True))
 
-    seg_layers.append(conv_op(features[-1]//(n+2), out_channels, 1,1, bias=True))
+      seg_layers.append(conv_op(features[-(n+2)]*2, out_channels, 1,1, bias=True))
+
+    seg_layers.append(conv_op(features[-(n+2)]*2, out_channels, 1,1, bias=True))
 
     self.conv_up = nn.ModuleList(resolution_up)
     self.seg_layers = nn.ModuleList(seg_layers)
@@ -411,19 +413,19 @@ class ConvNextVisionDecoder(nn.Module):
   def forward(self, skips: list[torch.Tensor]):
 
     seg_outputs = []
-    for s in range(len(self.features)):
+    for s in range(len(self.features)-1):
       x = self.ups[s](skips[s]) # upsample
       # print('Upsample_1', x.shape)
-      skip = self.pwconv[s](skips[(s+1)])
+      #skip = self.pwconv[s](skips[(s+1)])
+      #x = torch.cat([x, skip], dim = 1)
       # print('conv1 1x1', layer2.shape)
-      skip = self.atf[s](u = x, f = skips[s+1])
-      x = torch.cat([x,skip], dim = 1)
+      x = self.atf[s](u = x, f = skips[s+1])
       x = self.dblock[s](x) # Decoder Convolutions
 
       if self.deep_supervision:
         seg_outputs.append(self.seg_layers[s](x))
 
-    for c in range(0, len(self.conv_up)-1, 2):
+    for c in range(0, len(self.conv_up), 2):
       x = self.conv_up[c](x)
       x = self.conv_up[c+1](x)
       if self.deep_supervision and c != (len(self.conv_up)-2):

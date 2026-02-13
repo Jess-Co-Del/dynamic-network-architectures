@@ -27,17 +27,17 @@ class DualPathResponseFusionAttention(nn.Module):
           norm_op = nn.BatchNorm3d
 
         self.W_f  = nn.Sequential(
-            conv_op(F_g, F_int, kernel_size=1,stride=1,padding=0,bias=False),
+            conv_op(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=False),
             norm_op(F_int)
             )
         
         self.W_u = nn.Sequential(
-            conv_op(F_l, F_int, kernel_size=1,stride=1,padding=0,bias=True),
+            conv_op(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
             norm_op(F_int)
         )
 
         self.W = nn.Sequential(
-            conv_op(F_int, 1, kernel_size=1,stride=1,padding=0,bias=True),
+            conv_op(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
             norm_op(1),
             nn.Sigmoid()
         )
@@ -54,7 +54,7 @@ class DualPathResponseFusionAttention(nn.Module):
         psi = self.W(psi)
         theta_fuse = n_f * psi
 
-        return n_u2 + theta_fuse
+        return torch.cat([n_u2, theta_fuse], dim = 1)
 
 
 class ResidualAttentionSoftMasking(nn.Module):
