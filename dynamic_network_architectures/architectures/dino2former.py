@@ -574,8 +574,8 @@ class IJEPAMask2Former(nn.Module):
         freeze_backbone = True,
         image_size    = 224,
         patch_size    = 16,
-        deep_supervision: bool = False
-    ):
+         deep_supervision: bool = False
+   ):
         super().__init__()
         hidden_size = 1408   # ViT-G hidden dim
 
@@ -616,7 +616,7 @@ class IJEPAMask2Former(nn.Module):
         features = []
         for layer_idx in self.OUT_LAYER_INDICES:
             tokens  = outputs.hidden_states[layer_idx]     # [B, 197, 1408]
-            spatial = (tokens  # [:, 1:, :]                    # drop CLS → [B, 196, 1408]
+            spatial = (tokens[:, 1:, :]                    # drop CLS → [B, 196, 1408]
                        .permute(0, 2, 1)                   # [B, 1408, 196]
                        .reshape(B, -1, self.grid_size, self.grid_size))  # [B, 1408, 14, 14]
             features.append(spatial)
@@ -654,10 +654,8 @@ class IJEPAMask2Former(nn.Module):
 
         if targets is not None:
             # Training: compute loss
-            criterion = Mask2FormerLoss(
-                num_classes=self.transformer_decoder.class_head.out_features - 1)
-            loss, loss_dict = criterion(
-                pred_logits, pred_masks, aux_outputs, targets)
+            criterion = Mask2FormerLoss(num_classes=self.transformer_decoder.class_head.out_features - 1)
+            loss, loss_dict = criterion(pred_logits, pred_masks, aux_outputs, targets)
             return loss, loss_dict
 
         return pred_logits, pred_masks_full
