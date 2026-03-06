@@ -94,6 +94,27 @@ class MedSigLIPLinearSegHead(nn.Module):
             nn.Conv2d(hidden_size // 4, num_classes, kernel_size=1),
         )
 
+       # ── Built-in normalization (SigLIP: map [0,1] → [-1,1]) ─────────
+        self.register_buffer(
+            "pixel_mean",
+            torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "pixel_std",
+            torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1),
+        )
+
+    def _preprocess(self, pixel_values: Tensor) -> Tensor:
+        """Tile grayscale → 3-ch, then normalize [0,1] → [-1,1]."""
+        if self.input_channels == 1:
+            pixel_values = pixel_values.repeat(1, 3, 1, 1)
+
+        if pixel_values.max() > 1. or  pixel_values.max() < 0.:
+            pixel_values = pixel_values - pixel_values.min()
+            pixel_values /= pixel_values.max()
+
+        return (pixel_values - self.pixel_mean) / self.pixel_std
+
     def forward(self, pixel_values: Tensor) -> Tensor:
         """
         Args:
@@ -104,9 +125,8 @@ class MedSigLIPLinearSegHead(nn.Module):
         """
         B = pixel_values.shape[0]
 
-        # Tile grayscale → 3-ch if needed
-        if self.input_channels == 1:
-            pixel_values = pixel_values.repeat(1, 3, 1, 1)
+        pixel_values = self._preprocess(pixel_values)
+        #print(pixel_values.max(), pixel_values.min())
 
         # ── 1. Run MedSigLIP vision encoder ───────────────────────────────
         outputs = self.backbone(pixel_values=pixel_values)
@@ -200,6 +220,26 @@ class MedSigLIPLinearSegHead3D(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv3d(hidden_size // 4, num_classes, kernel_size=1),
         )
+       # ── Built-in normalization (SigLIP: map [0,1] → [-1,1]) ─────────
+        self.register_buffer(
+            "pixel_mean",
+            torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "pixel_std",
+            torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1),
+        )
+
+    def _preprocess(self, pixel_values: Tensor) -> Tensor:
+        """Tile grayscale → 3-ch, then normalize [0,1] → [-1,1]."""
+        if self.input_channels == 1:
+            pixel_values = pixel_values.repeat(1, 3, 1, 1)
+
+        if pixel_values.max() > 1. or  pixel_values.max() < 0.:
+            pixel_values = (pixel_values - pixel_values.min()) 
+            pixel_values /= pixel_values.max()
+
+        return (pixel_values - self.pixel_mean) / self.pixel_std
 
     def _encode_slices(self, x: Tensor) -> Tensor:
         """
@@ -217,8 +257,7 @@ class MedSigLIPLinearSegHead3D(nn.Module):
         # Reshape to process all slices in one batch
         slices = x.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
 
-        if self.input_channels == 1:
-            slices = slices.repeat(1, 3, 1, 1)
+        slices = self._preprocess(slices)
 
         outputs = self.backbone(pixel_values=slices)
         # SigLIP: no CLS token, all tokens are patches

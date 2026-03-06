@@ -95,6 +95,34 @@ class DINOv3LinearSegHead(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_size // 4, num_classes, kernel_size=1),
         )
+        self.register_buffer(
+            "pixel_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "pixel_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+        )
+
+    def _preprocess(self, pixel_values: Tensor) -> Tensor:
+        """
+        Tile grayscale → 3-ch if needed, then apply ImageNet normalization.
+
+        Args:
+            pixel_values: [B, C, H, W] with values in [0, 1].
+
+        Returns:
+            Normalized [B, 3, H, W] tensor.
+        """
+        # Tile grayscale → 3-ch if needed
+        if self.input_channels == 1:
+            pixel_values = pixel_values.repeat(1, 3, 1, 1)
+        
+        if pixel_values.max() > 1. or  pixel_values.max() < 0.:
+            pixel_values = (pixel_values - pixel_values.min())
+            pixel_values /= pixel_values.max()
+
+        return (pixel_values - self.pixel_mean) / self.pixel_std
 
     def forward(self, pixel_values: Tensor) -> Tensor:
         """
@@ -106,15 +134,15 @@ class DINOv3LinearSegHead(nn.Module):
         """
         B = pixel_values.shape[0]
 
-        # Tile grayscale → 3-ch if needed
-        if self.input_channels == 1:
-            pixel_values = pixel_values.repeat(1, 3, 1, 1)
+        # 0. Preprocess
+        pixel_values = self._preprocess(pixel_values)
+        #print(pixel_values.max(), pixel_values.min())
 
-        # ── 1. Run DINOv3 encoder ─────────────────────────────────────────
+        # 1. Run DINOv3 encoder ─────────────────────────────────────────
         outputs = self.backbone(pixel_values=pixel_values)
         # last_hidden_state: [B, 1 + num_reg + num_patches, hidden_size]
 
-        # ── 2. Skip CLS + register tokens, reshape to spatial grid ────────
+        # 2. Skip CLS + register tokens, reshape to spatial grid ────────
         patch_tokens = outputs.last_hidden_state[:, self.num_prefix_tokens:, :]
         # [B, num_patches, hidden_size]
 
@@ -122,10 +150,10 @@ class DINOv3LinearSegHead(nn.Module):
              .permute(0, 2, 1)                                    # [B, D, N]
              .reshape(B, -1, self.grid_size, self.grid_size))  # [B, D, g, g]
 
-        # ── 3. Apply segmentation head ────────────────────────────────────
+        # 3. Apply segmentation head ────────────────────────────────────
         x = self.seg_head(x)  # [B, num_classes, g, g]
 
-        # ── 4. Bilinear upsample to input resolution ──────────────────────
+        # 4. Bilinear upsample to input resolution ──────────────────────
         x = F.interpolate(
             x,
             size=(self.image_size, self.image_size),
@@ -197,6 +225,34 @@ class DINOv3LinearSegHead3D(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv3d(hidden_size // 4, num_classes, kernel_size=1),
         )
+        self.register_buffer(
+            "pixel_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "pixel_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+        )
+
+    def _preprocess(self, pixel_values: Tensor) -> Tensor:
+        """
+        Tile grayscale → 3-ch if needed, then apply ImageNet normalization.
+
+        Args:
+            pixel_values: [B, C, H, W] with values in [0, 1].
+
+        Returns:
+            Normalized [B, 3, H, W] tensor.
+        """
+        # Tile grayscale → 3-ch if needed
+        if self.input_channels == 1:
+            pixel_values = pixel_values.repeat(1, 3, 1, 1)
+        
+        if pixel_values.max() > 1. or  pixel_values.max() < 0.:
+            pixel_values = (pixel_values - pixel_values.min())
+            pixel_values /= pixel_values.max()
+            
+        return (pixel_values - self.pixel_mean) / self.pixel_std
 
     def _encode_slices(self, x: Tensor) -> Tensor:
         """
@@ -214,9 +270,9 @@ class DINOv3LinearSegHead3D(nn.Module):
         # Reshape to process all slices in one batch
         slices = x.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
 
-        if self.input_channels == 1:
-            slices = slices.repeat(1, 3, 1, 1)
+        slices = self._preprocess(slices)
 
+        #print(slices.max(), slices.min())
         outputs = self.backbone(pixel_values=slices)
         # Skip CLS + register tokens
         patch_tokens = outputs.last_hidden_state[:, self.num_prefix_tokens:, :]
