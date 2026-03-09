@@ -34,6 +34,12 @@ import torch.nn.functional as F
 from torch import Tensor
 from transformers import AutoModel, AutoProcessor
 
+from typing import Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model
@@ -69,6 +75,19 @@ class IJEPALinearSegHead(nn.Module):
         self.image_size = image_size
         self.patch_size = patch_size
         self.grid_size  = image_size // patch_size   # 14 for 224/16
+        self.input_channels = input_channels
+
+        # ── Built-in normalization (ImageNet stats) ──────────────────────
+        # Expects raw [0, 1] input; applies ImageNet mean/std.
+        # Buffers follow .to(device) / .half() automatically.
+        self.register_buffer(
+            "pixel_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "pixel_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+        )
 
         # ── Backbone (ViT-G, hidden_size = 1408) ─────────────────────────
         self.backbone = AutoModel.from_pretrained(model_id)
@@ -87,23 +106,45 @@ class IJEPALinearSegHead(nn.Module):
             nn.Conv2d(hidden_size // 4, num_classes, kernel_size=1),
         )
 
+    def _normalize(self, pixel_values: Tensor) -> Tensor:
+        """
+        Tile grayscale → 3-ch if needed, then apply ImageNet normalization.
+
+        Args:
+            pixel_values: [B, C, H, W] with values in [0, 1].
+
+        Returns:
+            Normalized [B, 3, H, W] tensor.
+        """
+        if self.input_channels == 1:
+            pixel_values = pixel_values.repeat(1, 3, 1, 1)
+
+        # Normalize to range [0,1] if needed
+        if pixel_values.max() > 1. or  pixel_values.max() < 0.:
+            pixel_values = (pixel_values - pixel_values.min())
+            pixel_values /= pixel_values.max()
+
+        return (pixel_values - self.pixel_mean) / self.pixel_std
+
     def forward(self, pixel_values: Tensor) -> Tensor:
         """
         Args:
-            pixel_values: [B, 3, image_size, image_size]
+            pixel_values: [B, C, image_size, image_size]  values in [0, 1]
 
         Returns:
             logits: [B, num_classes, image_size, image_size]
         """
         B = pixel_values.shape[0]
 
-        pixel_values = torch.tile(pixel_values, (1,3,1,1)) # [B, 3, H, W], H=W=224
+        # ── 0. Normalize ──────────────────────────────────────────────────
+        pixel_values = self._normalize(pixel_values)  # [B, 3, H, W]
+
         # ── 1. Run I-JEPA encoder ─────────────────────────────────────────
         outputs = self.backbone(pixel_values=pixel_values)
-        # last_hidden_state: [B, 196, 1408]  (197 = 196 patches)
+        # last_hidden_state: [B, 196, 1408]  (196 patches for 224/16)
 
         # ── 2. Reshape to spatial grid ───────────────────
-        patch_tokens = outputs.last_hidden_state  # [:, 1:, :]   # [B, 196, 1408]
+        patch_tokens = outputs.last_hidden_state  # [B, 196, 1408]
         x = (patch_tokens
              .permute(0, 2, 1)                                   # [B, 1408, 196]
              .reshape(B, -1, self.grid_size, self.grid_size)) # [B, 1408, 14, 14]
