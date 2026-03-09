@@ -34,6 +34,12 @@ import torch.nn.functional as F
 from torch import Tensor
 from transformers import AutoModel, AutoProcessor
 
+from typing import Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model
@@ -69,6 +75,19 @@ class IJEPALinearSegHead(nn.Module):
         self.image_size = image_size
         self.patch_size = patch_size
         self.grid_size  = image_size // patch_size   # 14 for 224/16
+        self.input_channels = input_channels
+
+        # ── Built-in normalization (ImageNet stats) ──────────────────────
+        # Expects raw [0, 1] input; applies ImageNet mean/std.
+        # Buffers follow .to(device) / .half() automatically.
+        self.register_buffer(
+            "pixel_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "pixel_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+        )
 
         # ── Backbone (ViT-G, hidden_size = 1408) ─────────────────────────
         self.backbone = AutoModel.from_pretrained(model_id)
@@ -87,22 +106,45 @@ class IJEPALinearSegHead(nn.Module):
             nn.Conv2d(hidden_size // 4, num_classes, kernel_size=1),
         )
 
+    def _normalize(self, pixel_values: Tensor) -> Tensor:
+        """
+        Tile grayscale → 3-ch if needed, then apply ImageNet normalization.
+
+        Args:
+            pixel_values: [B, C, H, W] with values in [0, 1].
+
+        Returns:
+            Normalized [B, 3, H, W] tensor.
+        """
+        if self.input_channels == 1:
+            pixel_values = pixel_values.repeat(1, 3, 1, 1)
+
+        # Normalize to range [0,1] if needed
+        if pixel_values.max() > 1. or  pixel_values.max() < 0.:
+            pixel_values = (pixel_values - pixel_values.min())
+            pixel_values /= pixel_values.max()
+
+        return (pixel_values - self.pixel_mean) / self.pixel_std
+
     def forward(self, pixel_values: Tensor) -> Tensor:
         """
         Args:
-            pixel_values: [B, 3, image_size, image_size]
+            pixel_values: [B, C, image_size, image_size]  values in [0, 1]
 
         Returns:
             logits: [B, num_classes, image_size, image_size]
         """
         B = pixel_values.shape[0]
-        pixel_values = torch.tile(pixel_values, (1,3,1,1)) # [B, 3, H, W], H=W=224
+
+        # ── 0. Normalize ──────────────────────────────────────────────────
+        pixel_values = self._normalize(pixel_values)  # [B, 3, H, W]
+
         # ── 1. Run I-JEPA encoder ─────────────────────────────────────────
         outputs = self.backbone(pixel_values=pixel_values)
-        # last_hidden_state: [B, 196, 1408]  (197 = 196 patches)
+        # last_hidden_state: [B, 196, 1408]  (196 patches for 224/16)
 
         # ── 2. Reshape to spatial grid ───────────────────
-        patch_tokens = outputs.last_hidden_state  # [:, 1:, :]   # [B, 196, 1408]
+        patch_tokens = outputs.last_hidden_state  # [B, 196, 1408]
         x = (patch_tokens
              .permute(0, 2, 1)                                   # [B, 1408, 196]
              .reshape(B, -1, self.grid_size, self.grid_size)) # [B, 1408, 14, 14]
@@ -124,177 +166,6 @@ class IJEPALinearSegHead(nn.Module):
     def predict(self, pixel_values: Tensor) -> Tensor:
         """Returns per-pixel class indices. Shape: [B, H, W]."""
         return self.forward(pixel_values).argmax(dim=1)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Loss
-# ─────────────────────────────────────────────────────────────────────────────
-
-class SegmentationLoss(nn.Module):
-    """
-    Standard cross-entropy loss for semantic segmentation.
-    Ignores pixels labeled with ignore_index (common in ADE20K = 255).
-    """
-
-    def __init__(self, ignore_index: int = 255) -> None:
-        super().__init__()
-        self.ce = nn.CrossEntropyLoss(ignore_index=ignore_index)
-
-    def forward(self, logits: Tensor, targets: Tensor) -> Tensor:
-        """
-        Args:
-            logits:  [B, num_classes, H, W]
-            targets: [B, H, W]  integer class labels
-
-        Returns:
-            scalar loss
-        """
-        return self.ce(logits, targets)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Quick usage demo
-# ─────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model     = IJEPALinearSegHead(num_classes=150, image_size=224).to(device)
-    criterion = SegmentationLoss(ignore_index=255)
-
-    # Dummy batch
-    images  = torch.randn(2, 3, 224, 224, device=device)
-    targets = torch.randint(0, 150, (2, 224, 224), device=device)
-
-    # Forward
-    logits = model(images)                     # [2, 150, 224, 224]
-    loss   = criterion(logits, targets)
-
-    print(f"Output shape : {logits.shape}")    # torch.Size([2, 150, 224, 224])
-    print(f"Loss         : {loss.item():.4f}")
-
-    # Count trainable vs frozen params
-    total     = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total params     : {total:,}")
-    print(f"Trainable params : {trainable:,}")
-
-
-"""
-arch1_3d_linear_head.py — 3D Linear Probe / Simple MLP Segmentation Head
-=========================================================================
-Extends Architecture 1 to volumetric inputs [B, C, D, H, W].
-Freezes the inflated 3D I-JEPA encoder and trains only a 3D 1×1 conv
-head + trilinear upsample to produce voxel-wise segmentation logits.
-
-Typical use case:
-  - Medical image segmentation (CT, MRI) with limited labels
-  - Benchmarking 3D I-JEPA feature quality
-  - Fast baseline: only the head is trained
-
-Input:   [B, C, D, H, W]   e.g. [2, 1, 32, 224, 224] for CT volumes
-Output:  [B, num_classes, D, H, W]
-
-Dependencies:
-    pip install torch transformers
-    (ijepa_3d_backbone.py must be in the same directory)
-"""
-
-from .jepavitbase import IJEPAViT3D
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Model
-# ─────────────────────────────────────────────────────────────────────────────
-
-class IJEPALinearSegHead3D(nn.Module):
-    """
-    3D I-JEPA backbone + linear volumetric segmentation head.
-
-    The head consists of a small 1×1×1 conv bottleneck that maps the
-    1408-dim I-JEPA features to num_classes, followed by trilinear
-    upsampling back to the original input resolution.
-
-    Args:
-        num_classes:     Number of segmentation classes.
-        input_channels:  Input volume channels (1 for CT, 3 for RGB video).
-        patch_d:         Depth patch size for the 3D patch embedding.
-        patch_hw:        Height/width patch size (16, matching I-JEPA).
-        freeze_backbone: Freeze inflated ViT weights.
-        model_id:        HuggingFace I-JEPA 2D checkpoint to inflate.
-    """
-
-    def __init__(
-        self,
-        num_classes:     int  = 14,      # e.g. 14 organs for CT segmentation
-        input_channels:  int  = 1,
-        patch_d:         int  = 2,
-        patch_hw:        int  = 16,
-        freeze_backbone: bool = True,
-        model_id:        str  = "facebook/ijepa_vitg16_22k",
-        deep_supervision: bool = False
-    ) -> None:
-        super().__init__()
-
-        hidden_size = 1408   # ViT-G constant
-
-        # ── 3D Backbone (inflated from 2D I-JEPA) ────────────────────────
-        self.backbone = IJEPAViT3D(
-            input_channels = input_channels,
-            patch_d     = patch_d,
-            patch_h     = patch_hw,
-            patch_w     = patch_hw,
-            freeze      = freeze_backbone,
-            model_id    = model_id,
-        )
-
-        # ── 3D Segmentation Head ──────────────────────────────────────────
-        # 1×1×1 conv: projects volumetric feature map → class logits
-        # Analogous to the 2D version but with Conv3d
-        self.seg_head = nn.Sequential(
-            nn.Conv3d(hidden_size, hidden_size // 4, kernel_size=1, bias=False),
-            nn.BatchNorm3d(hidden_size // 4),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(hidden_size // 4, num_classes, kernel_size=1),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: [B, C, D, H, W]  — input volume
-
-        Returns:
-            logits: [B, num_classes, D, H, W]
-        """
-        B, C, D, H, W = x.shape
-
-        # ── 1. 3D Backbone → volumetric token sequence ───────────────────
-        out       = self.backbone(x)
-        tokens    = out['last_hidden_state']   # [B, N, 1408]
-        grid_dhw  = out['grid_dhw']            # (gd, gh, gw)
-
-        # ── 2. Reshape tokens → spatial feature volume ───────────────────
-        # [B, N, 1408] → [B, 1408, gd, gh, gw]
-        feat_vol = self.backbone.tokens_to_spatial(tokens, grid_dhw)
-
-        # ── 3. Segmentation head ──────────────────────────────────────────
-        logits_low = self.seg_head(feat_vol)   # [B, num_classes, gd, gh, gw]
-
-        # ── 4. Trilinear upsample to original volume resolution ───────────
-        logits = F.interpolate(
-            logits_low,
-            size=(D, H, W),
-            mode='trilinear',
-            align_corners=False,
-        )   # [B, num_classes, D, H, W]
-
-        return logits
-
-    @torch.no_grad()
-    def predict(self, x: Tensor) -> Tensor:
-        """Returns per-voxel class indices. Shape: [B, D, H, W]."""
-        return self.forward(x).argmax(dim=1)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Loss
@@ -376,6 +247,31 @@ class VolumetricSegLoss(nn.Module):
         dice_loss = self._dice_loss(logits, targets)
         return ce_loss + self.dice_weight * dice_loss
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Loss
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SegmentationLoss(nn.Module):
+    """
+    Standard cross-entropy loss for semantic segmentation.
+    Ignores pixels labeled with ignore_index (common in ADE20K = 255).
+    """
+
+    def __init__(self, ignore_index: int = 255) -> None:
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(ignore_index=ignore_index)
+
+    def forward(self, logits: Tensor, targets: Tensor) -> Tensor:
+        """
+        Args:
+            logits:  [B, num_classes, H, W]
+            targets: [B, H, W]  integer class labels
+
+        Returns:
+            scalar loss
+        """
+        return self.ce(logits, targets)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Quick usage demo
@@ -384,24 +280,22 @@ class VolumetricSegLoss(nn.Module):
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Typical medical imaging setup:
-    # - 1-channel CT volume
-    # - 32 axial slices, 224×224 spatial
-    # - 14 organ classes
-    model     = IJEPALinearSegHead3D(num_classes=14, input_channels=1).to(device)
-    criterion = VolumetricSegLoss(num_classes=14)
+    model     = IJEPALinearSegHead(num_classes=150, image_size=224).to(device)
+    # criterion = SegmentationLoss(ignore_index=255)
 
-    volumes = torch.randn(2, 1, 32, 224, 224, device=device)
-    targets = torch.randint(0, 14, (2, 32, 224, 224), device=device)
+    # # Dummy batch — values in [0, 1] (normalization is built in)
+    # images  = torch.rand(2, 1, 224, 224, device=device)
+    # targets = torch.randint(0, 150, (2, 224, 224), device=device)
 
-    logits = model(volumes)
-    loss   = criterion(logits, targets)
+    # # Forward
+    # logits = model(images)                     # [2, 150, 224, 224]
+    # loss   = criterion(logits, targets)
 
-    print(f"Input shape  : {volumes.shape}")   # [2, 1, 32, 224, 224]
-    print(f"Output shape : {logits.shape}")    # [2, 14, 32, 224, 224]
-    print(f"Loss         : {loss.item():.4f}")
+    # print(f"Output shape : {logits.shape}")    # torch.Size([2, 150, 224, 224])
+    # print(f"Loss         : {loss.item():.4f}")
 
+    # Count trainable vs frozen params
+    total     = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    frozen    = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    print(f"Total params     : {total:,}")
     print(f"Trainable params : {trainable:,}")
-    print(f"Frozen params    : {frozen:,}")
