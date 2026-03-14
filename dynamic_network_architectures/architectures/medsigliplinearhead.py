@@ -74,7 +74,7 @@ class MedSigLIPLinearSegHead(nn.Module):
         # MedSigLIP is a SiglipModel (vision + text); we only need vision.
         full_model = AutoModel.from_pretrained(model_id)
         self.backbone = full_model.vision_model
-        del full_model  # free the text encoder
+        del full_model  # free memory of the text encoder
 
         if freeze_backbone:
             for param in self.backbone.parameters():
