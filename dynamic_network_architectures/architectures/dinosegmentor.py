@@ -11,7 +11,7 @@ Architecture context
 DINOv2 is a Vision Transformer (ViT). Unlike CNNs, all transformer layers
 operate at the **same spatial resolution** — there is no built-in feature
 pyramid with decreasing spatial resolution. For a ViT with patch_size=14 and
-input 518×518, every hidden layer produces patch tokens of shape:
+input 224x224, every hidden layer produces patch tokens of shape:
 
     (batch, num_patches, hidden_dim)     e.g. (B, 1369, 384) for ViT-S/14
 
@@ -64,7 +64,7 @@ Usage
     )
 
     # Full segmentation model
-    model = DINOv2Segmenter(extractor, decoder, image_size=518)
+    model = DINOv2Segmenter(extractor, decoder, image_size=224)
     logits = model(pixel_values)  # (B, num_classes, H, W)
 """
 
@@ -312,7 +312,7 @@ class LinearDecoder(nn.Module):
     -------------
     - Ignores multi-layer feature richness; only uses the final layer.
     - No multi-scale reasoning.
-    - Output resolution limited to patch-grid resolution (e.g. 37×37 for 518px
+    - Output resolution limited to patch-grid resolution (e.g. 16x16 for 224px
       input with patch_size=14). Needs bilinear upsample to full resolution.
 
     Parameters
@@ -971,7 +971,7 @@ def build_segmenter(
     num_classes: int = 21,
     layer_indices: Optional[List[int]] = None,
     freeze_backbone: bool = True,
-    image_size: int = 518,
+    image_size: int = 224,
     deep_supervision: bool = False,
     **decoder_kwargs,
 ) -> DINOv2Segmenter:
