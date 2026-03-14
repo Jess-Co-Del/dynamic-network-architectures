@@ -76,7 +76,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import Dinov2Model
+from transformers import AutoModel
 
 
 # =============================================================================
@@ -102,27 +102,66 @@ class DINOv2FeatureExtractor(nn.Module):
 
     def __init__(
         self,
+        input_channels:   int  = 1,
         model_name: str = "facebook/dinov2-large",
-        layer_indices: List[int] = [2, 5, 8, 11],
+        layer_indices: List[int] = [1, 10, 20, 23],  # Total 25 blocks
+        adapter: str = 'last',
         freeze_backbone: bool = True,
     ):
         super().__init__()
-        self.backbone = Dinov2Model.from_pretrained(model_name)
-        self.layer_indices = sorted(layer_indices)
+        self.input_channels = input_channels
+
+        # ── Backbone ─────────────────────────────────────────────────────
+        self.backbone = AutoModel.from_pretrained(model_name, output_hidden_states=True)
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
         self.patch_size: int = self.backbone.config.patch_size
         self.hidden_dim: int = self.backbone.config.hidden_size
         self.num_layers: int = self.backbone.config.num_hidden_layers
 
-        # Validate layer indices
-        for idx in self.layer_indices:
-            if idx < 0 or idx >= self.num_layers:
-                raise ValueError(
-                    f"layer_index {idx} out of range [0, {self.num_layers - 1}]"
-                )
+        # ── Adapter strategy config ──────────────────────────────────────
+        self.adapter = adapter
+        if adapter == 'last':
+            self.layer_indices = [-1]
+        else:
+            self.layer_indices = sorted(layer_indices)
+            for idx in self.layer_indices:
+                if idx < 0 or idx >= self.num_layers:
+                    raise ValueError(
+                        f"layer_index {idx} out of range [0, {self.num_layers - 1}]"
+                    )
 
-        if freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
+        self.register_buffer(
+            "pixel_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "pixel_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+        )
+
+    def _preprocess(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        Tile grayscale → 3-ch if needed, then apply ImageNet normalization.
+
+        Args:
+            pixel_values: [B, C, H, W] with values in [0, 1].
+
+        Returns:
+            Normalized [B, 3, H, W] tensor.
+        """
+        # Tile grayscale → 3-ch if needed
+        if self.input_channels == 1:
+            pixel_values = pixel_values.repeat(1, 3, 1, 1)
+
+        # Normalize to range [0,1] if needed
+        if pixel_values.max() > 1. or  pixel_values.max() < 0.:
+            pixel_values = (pixel_values - pixel_values.min())
+            pixel_values /= pixel_values.max()
+
+        return (pixel_values - self.pixel_mean) / self.pixel_std
 
     def forward(
         self, pixel_values: torch.Tensor
@@ -145,7 +184,9 @@ class DINOv2FeatureExtractor(nn.Module):
         B, C, H, W = pixel_values.shape
         h = H // self.patch_size
         w = W // self.patch_size
-
+        # ── 0. Run DINOv2 preprocessing-───────────────────────────────────
+        pixel_values = self._preprocess(pixel_values)
+        # ── 1. Run DINOv2 encoding   -───────────────────────────────────
         outputs = self.backbone(
             pixel_values=pixel_values,
             output_hidden_states=True,
@@ -160,9 +201,10 @@ class DINOv2FeatureExtractor(nn.Module):
         hidden_states = outputs.hidden_states  # tuple of (B, seq_len, D)
 
         features = []
+
         for idx in self.layer_indices:
             # +1 because hidden_states[0] is the embedding layer output
-            hs = hidden_states[idx + 1]  # (B, seq_len, D)
+            hs = hidden_states[idx]  # (B, seq_len, D)
 
             # Remove CLS token (always at position 0)
             patch_tokens = hs[:, 1:, :]  # (B, seq_len - 1, D)
@@ -170,13 +212,14 @@ class DINOv2FeatureExtractor(nn.Module):
             # If the model has register tokens, they come right after CLS
             # and before the actual patch tokens. We need to remove them.
             num_register_tokens = getattr(
-                self.backbone.config, "num_register_tokens", 0
+                self.backbone.config,
+                "num_register_tokens", 0
             )
             if num_register_tokens > 0:
                 patch_tokens = patch_tokens[:, num_register_tokens:, :]
 
             # Truncate to exactly h * w tokens (safety for padding edge cases)
-            patch_tokens = patch_tokens[:, : h * w, :]
+            #patch_tokens = patch_tokens[:, : h * w, :]
 
             # Reshape to spatial grid: (B, h*w, D) -> (B, D, h, w)
             feat = patch_tokens.permute(0, 2, 1).reshape(B, -1, h, w)
@@ -922,12 +965,14 @@ class DINOv2Segmenter(nn.Module):
 # =============================================================================
 
 def build_segmenter(
+    input_channels:   int  = 1,
     model_name: str = "facebook/dinov2-small",
     decoder_type: str = "concat",
     num_classes: int = 21,
     layer_indices: Optional[List[int]] = None,
     freeze_backbone: bool = True,
     image_size: int = 518,
+    deep_supervision: bool = False,
     **decoder_kwargs,
 ) -> DINOv2Segmenter:
     """
@@ -959,9 +1004,11 @@ def build_segmenter(
     }
 
     extractor = DINOv2FeatureExtractor(
+        input_channels=input_channels,
         model_name=model_name,
         layer_indices=layer_indices or [2, 5, 8, 11],  # safe default for 12-layer
         freeze_backbone=freeze_backbone,
+        adapter=decoder_type
     )
 
     # Override layer indices after extractor creation if needed
@@ -1035,31 +1082,21 @@ if __name__ == "__main__":
     Run a shape-check smoke test with random tensors (does NOT download the
     actual DINOv2 weights — uses random initialization for speed).
     """
-    from transformers import Dinov2Config
-
     print("=" * 70)
     print("DINOv2 Segmentation Decoders — Smoke Test (random weights)")
     print("=" * 70)
 
     # Create a small DINOv2 config for fast testing
-    config = Dinov2Config(
-        hidden_size=384,
-        num_hidden_layers=12,
-        num_attention_heads=6,
-        intermediate_size=1536,
-        patch_size=14,
-        image_size=518,
-    )
-    backbone = Dinov2Model(config)
+    backbone = DINOv2FeatureExtractor(adapter='concat')
 
     # Mock the extractor
-    layer_indices = [2, 5, 8, 11]
-    B, C, H, W = 2, 3, 518, 518
+    dummy = torch.randn(1, 3, 224, 224)
+    B, C, H, W = dummy.shape
     h, w = H // 14, W // 14  # 37, 37
-    num_classes = 21
+    num_classes = 2
 
     # Simulate features
-    features = [torch.randn(B, 384, h, w) for _ in layer_indices]
+    features = backbone(dummy)
 
     decoders = {
         "LinearDecoder": LinearDecoder(384, num_classes),

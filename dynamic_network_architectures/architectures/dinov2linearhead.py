@@ -102,7 +102,7 @@ class DINOv2LinearSegHead(nn.Module):
         # Tile grayscale → 3-ch if needed
         if self.input_channels == 1:
             pixel_values = pixel_values.repeat(1, 3, 1, 1)
-        
+
         # Normalize to range [0,1] if needed
         if pixel_values.max() > 1. or  pixel_values.max() < 0.:
             pixel_values = (pixel_values - pixel_values.min())
