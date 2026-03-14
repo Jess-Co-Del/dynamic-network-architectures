@@ -281,18 +281,19 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model     = IJEPALinearSegHead(num_classes=150, image_size=224).to(device)
-    # criterion = SegmentationLoss(ignore_index=255)
 
-    # # Dummy batch — values in [0, 1] (normalization is built in)
-    # images  = torch.rand(2, 1, 224, 224, device=device)
-    # targets = torch.randint(0, 150, (2, 224, 224), device=device)
+    criterion = SegmentationLoss(ignore_index=255)
 
-    # # Forward
-    # logits = model(images)                     # [2, 150, 224, 224]
-    # loss   = criterion(logits, targets)
+    # Dummy batch — values in [0, 1] (normalization is built in)
+    images  = torch.rand(2, 3, 224, 224, device=device)
+    targets = torch.randint(0, 150, (2, 224, 224), device=device)
 
-    # print(f"Output shape : {logits.shape}")    # torch.Size([2, 150, 224, 224])
-    # print(f"Loss         : {loss.item():.4f}")
+    # Forward
+    logits = model(images)                     # [2, 150, 224, 224]
+    loss   = criterion(logits, targets)
+
+    print(f"Output shape : {logits.shape}")    # torch.Size([2, 150, 224, 224])
+    print(f"Loss         : {loss.item():.4f}")
 
     # Count trainable vs frozen params
     total     = sum(p.numel() for p in model.parameters())
