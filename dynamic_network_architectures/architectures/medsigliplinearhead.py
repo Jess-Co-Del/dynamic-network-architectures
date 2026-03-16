@@ -94,16 +94,6 @@ class MedSigLIPLinearSegHead(nn.Module):
             nn.Conv2d(hidden_size // 4, num_classes, kernel_size=1),
         )
 
-       # ── Built-in normalization (SigLIP: map [0,1] → [-1,1]) ─────────
-        self.register_buffer(
-            "pixel_mean",
-            torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1),
-        )
-        self.register_buffer(
-            "pixel_std",
-            torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1),
-        )
-
     def _preprocess(self, pixel_values: Tensor) -> Tensor:
         """Tile grayscale → 3-ch, then normalize [0,1] → [-1,1]."""
         if self.input_channels == 1:
@@ -113,7 +103,7 @@ class MedSigLIPLinearSegHead(nn.Module):
             pixel_values = pixel_values - pixel_values.min()
             pixel_values /= pixel_values.max()
 
-        return (pixel_values - self.pixel_mean) / self.pixel_std
+        return (pixel_values - 0.5) / 0.5
 
     def forward(self, pixel_values: Tensor) -> Tensor:
         """
@@ -220,16 +210,6 @@ class MedSigLIPLinearSegHead3D(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv3d(hidden_size // 4, num_classes, kernel_size=1),
         )
-       # ── Built-in normalization (SigLIP: map [0,1] → [-1,1]) ─────────
-        self.register_buffer(
-            "pixel_mean",
-            torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1),
-        )
-        self.register_buffer(
-            "pixel_std",
-            torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1),
-        )
-
     def _preprocess(self, pixel_values: Tensor) -> Tensor:
         """Tile grayscale → 3-ch, then normalize [0,1] → [-1,1]."""
         if self.input_channels == 1:
@@ -239,7 +219,7 @@ class MedSigLIPLinearSegHead3D(nn.Module):
             pixel_values = (pixel_values - pixel_values.min()) 
             pixel_values /= pixel_values.max()
 
-        return (pixel_values - self.pixel_mean) / self.pixel_std
+        return (pixel_values - 0.5) / 0.5
 
     def _encode_slices(self, x: Tensor) -> Tensor:
         """
