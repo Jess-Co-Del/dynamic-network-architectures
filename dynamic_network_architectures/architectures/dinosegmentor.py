@@ -153,7 +153,7 @@ class DINOv2FeatureExtractor(nn.Module):
             Normalized [B, 3, H, W] tensor.
         """
         # Tile grayscale → 3-ch if needed
-        if self.input_channels == 1:
+        if pixel_values.shape[1] == 1:
             pixel_values = pixel_values.repeat(1, 3, 1, 1)
 
         # Normalize to range [0,1] if needed
@@ -329,7 +329,7 @@ class LinearDecoder(nn.Module):
         super().__init__()
         self.use_layer_idx = use_layer_idx
         self.bn = nn.BatchNorm2d(hidden_dim)
-        self.classifier = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
+        #self.classifier = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
 
     def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
         """
@@ -344,7 +344,7 @@ class LinearDecoder(nn.Module):
         """
         x = features[self.use_layer_idx]
         x = self.bn(x)
-        return self.classifier(x)
+        return x  # self.classifier(x)
 
 
 # --------------------------------------------------------------------------
@@ -409,10 +409,10 @@ class MultiScaleConcatDecoder(nn.Module):
                 nn.Conv2d(concat_dim, intermediate_dim, kernel_size=1, bias=False),
                 nn.BatchNorm2d(intermediate_dim),
                 nn.ReLU(inplace=True),
-                nn.Conv2d(intermediate_dim, num_classes, kernel_size=1),
+                nn.Conv2d(intermediate_dim, hidden_dim, kernel_size=1),
             )
         else:
-            self.head = nn.Conv2d(concat_dim, num_classes, kernel_size=1)
+            self.head = nn.Conv2d(concat_dim, hidden_dim, kernel_size=1)
 
     def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
         """
@@ -497,7 +497,7 @@ class FPNLikeDecoder(nn.Module):
         # Final fusion: concat all levels → classify
         self.fusion = nn.Sequential(
             ConvBNReLU(fpn_dim * num_layers, fpn_dim, kernel_size=3, padding=1),
-            nn.Conv2d(fpn_dim, num_classes, kernel_size=1),
+            nn.Conv2d(fpn_dim, hidden_dim, kernel_size=1),
         )
 
     def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
@@ -609,7 +609,7 @@ class UPerNetLikeDecoder(nn.Module):
         self.fusion = nn.Sequential(
             ConvBNReLU(fpn_dim * num_layers, fpn_dim),
             nn.Dropout2d(0.1),
-            nn.Conv2d(fpn_dim, num_classes, kernel_size=1),
+            nn.Conv2d(fpn_dim, hidden_dim, kernel_size=1),
         )
 
     def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
@@ -736,7 +736,7 @@ class ProgressiveUpsampleDecoder(nn.Module):
                     )
                 )
 
-        self.classifier = nn.Conv2d(decoder_dim, num_classes, kernel_size=1)
+        #self.classifier = nn.Conv2d(decoder_dim, hidden_dim, kernel_size=1)
 
     def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
         """
@@ -772,7 +772,7 @@ class ProgressiveUpsampleDecoder(nn.Module):
             x = torch.cat([x, skip], dim=1)
             x = self.stages[i](x)
 
-        return self.classifier(x)
+        return x  # self.classifier(x)
 
 
 # --------------------------------------------------------------------------
@@ -860,8 +860,8 @@ class AttentionFusionDecoder(nn.Module):
 
         # Classification head
         self.classifier = nn.Sequential(
-            ConvBNReLU(fusion_dim, fusion_dim),
-            nn.Conv2d(fusion_dim, num_classes, kernel_size=1),
+            ConvBNReLU(fusion_dim, hidden_dim, kernel_size=1),
+            #nn.Conv2d(fusion_dim, num_classes, kernel_size=1),
         )
 
     def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
@@ -925,6 +925,8 @@ class DINOv2Segmenter(nn.Module):
         extractor: DINOv2FeatureExtractor,
         decoder: nn.Module,
         image_size: Optional[int] = None,
+        hidden_dim: int = 256,
+        num_classes: int = 1,
     ):
         super().__init__()
         self.extractor = extractor
@@ -933,6 +935,9 @@ class DINOv2Segmenter(nn.Module):
             self.image_size = (image_size, image_size)
         else:
             self.image_size = image_size
+        print(f'DINOv2Segmenter class: Encoder {extractor.__class__}, decoder {decoder.__class__}')
+
+        self.classifier = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """
@@ -957,7 +962,7 @@ class DINOv2Segmenter(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
-        return logits
+        return self.classifier(logits)
 
 
 # =============================================================================
@@ -966,9 +971,9 @@ class DINOv2Segmenter(nn.Module):
 
 def build_segmenter(
     input_channels:   int  = 1,
-    model_name: str = "facebook/dinov2-small",
+    model_name: str = "facebook/dinov2-large",
     decoder_type: str = "concat",
-    num_classes: int = 21,
+    num_classes: int = 1,
     layer_indices: Optional[List[int]] = None,
     freeze_backbone: bool = True,
     image_size: int = 224,
@@ -1023,37 +1028,38 @@ def build_segmenter(
     decoder_map = {
         "linear": lambda: LinearDecoder(
             hidden_dim=hidden_dim,
-            num_classes=num_classes,
+            num_classes=hidden_dim,
             **decoder_kwargs,
         ),
         "concat": lambda: MultiScaleConcatDecoder(
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-            num_classes=num_classes,
+            num_classes=hidden_dim,
             **decoder_kwargs,
         ),
         "fpn": lambda: FPNLikeDecoder(
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-            num_classes=num_classes,
+            num_classes=hidden_dim,
             **decoder_kwargs,
         ),
         "upernet": lambda: UPerNetLikeDecoder(
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-            num_classes=num_classes,
+            num_classes=hidden_dim,
             **decoder_kwargs,
         ),
         "progressive": lambda: ProgressiveUpsampleDecoder(
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-            num_classes=num_classes,
+            num_classes=hidden_dim,
+            decoder_dim=hidden_dim,
             **decoder_kwargs,
         ),
         "attention": lambda: AttentionFusionDecoder(
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-            num_classes=num_classes,
+            num_classes=hidden_dim,
             **decoder_kwargs,
         ),
     }
@@ -1070,6 +1076,8 @@ def build_segmenter(
         extractor=extractor,
         decoder=decoder,
         image_size=image_size,
+        hidden_dim=hidden_dim*4 if decoder_type == 'concat' else hidden_dim,
+        num_classes=num_classes
     )
 
 
@@ -1086,31 +1094,65 @@ if __name__ == "__main__":
     print("DINOv2 Segmentation Decoders — Smoke Test (random weights)")
     print("=" * 70)
 
-    # Create a small DINOv2 config for fast testing
-    backbone = DINOv2FeatureExtractor(adapter='concat')
+    def count_trainable_params(module):
+        return sum(p.numel() for p in module.parameters() if p.requires_grad)
 
-    # Mock the extractor
-    dummy = torch.randn(1, 3, 224, 224)
-    B, C, H, W = dummy.shape
-    h, w = H // 14, W // 14  # 37, 37
-    num_classes = 2
+    IMAGE_SHAPE = (1, 3, 224, 224)
+    NUM_CLASSES = 2
+    HIDDEN_DIM = 1024  # ViT-L
+    NUM_LAYERS = 4
 
-    # Simulate features
-    features = backbone(dummy)
+    # Build extractor once (frozen backbone)
+    backbone = DINOv2FeatureExtractor(
+        model_name="facebook/dinov2-large",
+        layer_indices=[2, 5, 8, 11],
+        adapter="concat",
+        freeze_backbone=True,
+    )
+    backbone.eval()
+
+    dummy = torch.randn(*IMAGE_SHAPE)
+    with torch.no_grad():
+        features, h, w = backbone(dummy)
+
+    print(f"\nInput shape : {IMAGE_SHAPE}")
+    print(f"Patch grid  : {h}×{w}  (patch_size=14, input=224)")
+    print(f"Num features: {len(features)}  each {tuple(features[0].shape)}")
+    print(f"Backbone trainable params: {count_trainable_params(backbone):,}  (frozen → 0)\n")
+    print(f"{'Decoder':<35} {'Trainable Params':>18}  {'Output Shape'}")
+    print("-" * 70)
 
     decoders = {
-        "LinearDecoder": LinearDecoder(384, num_classes),
-        "MultiScaleConcatDecoder": MultiScaleConcatDecoder(384, 4, num_classes, intermediate_dim=256),
-        "FPNLikeDecoder": FPNLikeDecoder(384, 4, fpn_dim=256, num_classes=num_classes),
-        "UPerNetLikeDecoder": UPerNetLikeDecoder(384, 4, fpn_dim=256, num_classes=num_classes),
-        "ProgressiveUpsampleDecoder": ProgressiveUpsampleDecoder(384, 4, decoder_dim=128, num_classes=num_classes),
-        "AttentionFusionDecoder": AttentionFusionDecoder(384, 4, fusion_dim=128, num_heads=4, num_classes=num_classes),
+        "LinearDecoder": LinearDecoder(
+            hidden_dim=HIDDEN_DIM, num_classes=NUM_CLASSES
+        ),
+        "MultiScaleConcatDecoder": MultiScaleConcatDecoder(
+            hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
+            num_classes=NUM_CLASSES, intermediate_dim=256
+        ),
+        "FPNLikeDecoder": FPNLikeDecoder(
+            hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
+            fpn_dim=256, num_classes=NUM_CLASSES
+        ),
+        "UPerNetLikeDecoder": UPerNetLikeDecoder(
+            hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
+            fpn_dim=256, num_classes=NUM_CLASSES
+        ),
+        "ProgressiveUpsampleDecoder": ProgressiveUpsampleDecoder(
+            hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
+            decoder_dim=256, num_classes=NUM_CLASSES
+        ),
+        "AttentionFusionDecoder": AttentionFusionDecoder(
+            hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
+            fusion_dim=256, num_heads=4, num_classes=NUM_CLASSES
+        ),
     }
 
     for name, decoder in decoders.items():
         decoder.eval()
         with torch.no_grad():
             out = decoder(features)
-        print(f"  {name:35s}  input: 4×(B,384,{h},{w})  →  output: {tuple(out.shape)}")
+        n_params = count_trainable_params(decoder)
+        print(f"  {name:<33} {n_params:>18,}  {tuple(out.shape)}")
 
-    print("\nAll smoke tests passed.")
+    print("\nAll smoke tests passed ✓")
