@@ -1,236 +1,12 @@
-"""
-DINOv2 Semantic Segmentation Decoders
-======================================
-
-A collection of nn.Module implementations that extract intermediate feature maps
-from a frozen (or fine-tunable) DINOv2 backbone and decode them into per-pixel
-semantic segmentation predictions.
-
-Architecture context
---------------------
-DINOv2 is a Vision Transformer (ViT). Unlike CNNs, all transformer layers
-operate at the **same spatial resolution** — there is no built-in feature
-pyramid with decreasing spatial resolution. For a ViT with patch_size=14 and
-input 224x224, every hidden layer produces patch tokens of shape:
-
-    (batch, num_patches, hidden_dim)     e.g. (B, 1369, 384) for ViT-S/14
-
-where num_patches = (H // patch_size) * (W // patch_size) = 37 * 37 = 1369.
-
-The [CLS] token is prepended (index 0), so the full sequence length is
-num_patches + 1. For models *with registers*, additional register tokens
-are also prepended after CLS.
-
-Key design decision: which layers to tap
------------------------------------------
-Because all layers share the same resolution, we cannot directly mimic FPN-style
-multi-scale fusion as done with CNNs (ResNet stages at 1/4, 1/8, 1/16, 1/32).
-Instead, we treat layers at different *depths* as providing different levels of
-semantic abstraction (shallow = low-level / texture, deep = high-level /
-semantic), all at the same spatial grid.
-
-The default layer indices used here follow established practice:
-    ViT-S (12 layers): layers [2, 5, 8, 11]   (evenly spaced, 0-indexed)
-    ViT-B (12 layers): layers [2, 5, 8, 11]
-    ViT-L (24 layers): layers [4, 11, 17, 23]
-    ViT-g (40 layers): layers [9, 19, 29, 39]
-
-Dependencies
-------------
-    pip install torch transformers
-
-Usage
------
-    from dinov2_segmentation_decoders import (
-        DINOv2FeatureExtractor,
-        LinearDecoder,
-        MultiScaleConcatDecoder,
-        FPNLikeDecoder,
-        UPerNetLikeDecoder,
-        ProgressiveUpsampleDecoder,
-    )
-
-    # Instantiate feature extractor (wraps HuggingFace DINOv2)
-    extractor = DINOv2FeatureExtractor(
-        model_name="facebook/dinov2-small",
-        layer_indices=[2, 5, 8, 11],
-        freeze_backbone=True,
-    )
-
-    # Pick a decoder
-    decoder = LinearDecoder(
-        hidden_dim=extractor.hidden_dim,
-        num_classes=21,
-    )
-
-    # Full segmentation model
-    model = DINOv2Segmenter(extractor, decoder, image_size=224)
-    logits = model(pixel_values)  # (B, num_classes, H, W)
-"""
-
-from __future__ import annotations
-
-import math
-from typing import List, Optional, Tuple
+# =============================================================================
+# 2. DECODER STRATEGIES
+# =============================================================================
+from typing import List, Optional, Tuple, Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModel
 
-
-# =============================================================================
-# 1. FEATURE EXTRACTOR — wraps HuggingFace DINOv2 and returns intermediate maps
-# =============================================================================
-
-class DINOv2FeatureExtractor(nn.Module):
-    """
-    Wraps a HuggingFace ``Dinov2Model`` and returns patch-token feature maps
-    from selected intermediate transformer layers.
-
-    Parameters
-    ----------
-    model_name : str
-        HuggingFace model identifier, e.g. ``"facebook/dinov2-small"``,
-        ``"facebook/dinov2-base"``, ``"facebook/dinov2-large"``,
-        ``"facebook/dinov2-giant"``.
-    layer_indices : list[int]
-        0-based indices of the transformer layers whose hidden states to return.
-    freeze_backbone : bool
-        If True, all backbone parameters are frozen (no gradient).
-    """
-
-    def __init__(
-        self,
-        input_channels:   int  = 1,
-        model_name: str = "facebook/dinov2-large",
-        layer_indices: List[int] = [1, 10, 20, 23],  # Total 25 blocks
-        adapter: str = 'last',
-        freeze_backbone: bool = True,
-    ):
-        super().__init__()
-        self.input_channels = input_channels
-
-        # ── Backbone ─────────────────────────────────────────────────────
-        self.backbone = AutoModel.from_pretrained(model_name, output_hidden_states=True)
-        if freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
-
-        self.patch_size: int = self.backbone.config.patch_size
-        self.hidden_dim: int = self.backbone.config.hidden_size
-        self.num_layers: int = self.backbone.config.num_hidden_layers
-
-        # ── Adapter strategy config ──────────────────────────────────────
-        self.adapter = adapter
-        if adapter == 'last':
-            self.layer_indices = [-1]
-        else:
-            self.layer_indices = sorted(layer_indices)
-            for idx in self.layer_indices:
-                if idx < 0 or idx >= self.num_layers:
-                    raise ValueError(
-                        f"layer_index {idx} out of range [0, {self.num_layers - 1}]"
-                    )
-
-        self.register_buffer(
-            "pixel_mean",
-            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
-        )
-        self.register_buffer(
-            "pixel_std",
-            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
-        )
-
-    def _preprocess(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """
-        Tile grayscale → 3-ch if needed, then apply ImageNet normalization.
-
-        Args:
-            pixel_values: [B, C, H, W] with values in [0, 1].
-
-        Returns:
-            Normalized [B, 3, H, W] tensor.
-        """
-        # Tile grayscale → 3-ch if needed
-        if pixel_values.shape[1] == 1:
-            pixel_values = pixel_values.repeat(1, 3, 1, 1)
-
-        # Normalize to range [0,1] if needed
-        if pixel_values.max() > 1. or  pixel_values.max() < 0.:
-            pixel_values = (pixel_values - pixel_values.min())
-            pixel_values /= pixel_values.max()
-
-        return (pixel_values - self.pixel_mean) / self.pixel_std
-
-    def forward(
-        self, pixel_values: torch.Tensor
-    ) -> Tuple[List[torch.Tensor], int, int]:
-        """
-        Parameters
-        ----------
-        pixel_values : Tensor of shape (B, 3, H, W)
-
-        Returns
-        -------
-        features : list[Tensor]
-            Each tensor has shape (B, hidden_dim, h, w) where
-            h = H // patch_size, w = W // patch_size.
-        h : int
-            Spatial height of the patch grid.
-        w : int
-            Spatial width of the patch grid.
-        """
-        B, C, H, W = pixel_values.shape
-        h = H // self.patch_size
-        w = W // self.patch_size
-        # ── 0. Run DINOv2 preprocessing-───────────────────────────────────
-        pixel_values = self._preprocess(pixel_values)
-        # ── 1. Run DINOv2 encoding   -───────────────────────────────────
-        outputs = self.backbone(
-            pixel_values=pixel_values,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-
-        # outputs.hidden_states is a tuple of (num_layers + 1) tensors
-        # index 0 = embedding output, index i = output of layer i
-        # Each tensor shape: (B, seq_len, hidden_dim)
-        # seq_len = 1 (CLS) + num_patches [+ num_register_tokens]
-
-        hidden_states = outputs.hidden_states  # tuple of (B, seq_len, D)
-
-        features = []
-
-        for idx in self.layer_indices:
-            # +1 because hidden_states[0] is the embedding layer output
-            hs = hidden_states[idx]  # (B, seq_len, D)
-
-            # Remove CLS token (always at position 0)
-            patch_tokens = hs[:, 1:, :]  # (B, seq_len - 1, D)
-
-            # If the model has register tokens, they come right after CLS
-            # and before the actual patch tokens. We need to remove them.
-            num_register_tokens = getattr(
-                self.backbone.config,
-                "num_register_tokens", 0
-            )
-            if num_register_tokens > 0:
-                patch_tokens = patch_tokens[:, num_register_tokens:, :]
-
-            # Truncate to exactly h * w tokens (safety for padding edge cases)
-            #patch_tokens = patch_tokens[:, : h * w, :]
-
-            # Reshape to spatial grid: (B, h*w, D) -> (B, D, h, w)
-            feat = patch_tokens.permute(0, 2, 1).reshape(B, -1, h, w)
-            features.append(feat)
-
-        return features, h, w
-
-
-# =============================================================================
-# 2. DECODER STRATEGIES
-# =============================================================================
 
 # ---- Shared utility blocks ----
 
@@ -248,6 +24,26 @@ class ConvBNReLU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(x)
 
+
+class PUP(nn.Module):
+    """
+    Progressive Uppsampling block
+    Conv2d → BatchNorm → ReLU (a ubiquitous building block)."""
+
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 2, kernel_size: int = 3, padding: int = 1):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.ConvTranspose2d(in_ch, in_ch, kernel_size, stride=stride),
+            nn.Conv2d(in_ch, out_ch, kernel_size, padding=padding, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_ch, out_ch, kernel_size, padding=padding, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
 
 class PyramidPoolingModule(nn.Module):
     """
@@ -297,10 +93,10 @@ class LinearDecoder(nn.Module):
     Why use this
     ------------
     * Baseline / sanity check — if a linear head already works well, the
-      DINOv2 features are strong enough and a complex decoder adds
+      MedSigLip features are strong enough and a complex decoder adds
       unnecessary parameters.
     * Fastest to train and least memory.
-    * Established in the DINOv2 paper and repository (BNHead).
+    * Established in the MedSigLip paper and repository (BNHead).
 
     Advantages
     ----------
@@ -312,7 +108,7 @@ class LinearDecoder(nn.Module):
     -------------
     - Ignores multi-layer feature richness; only uses the final layer.
     - No multi-scale reasoning.
-    - Output resolution limited to patch-grid resolution (e.g. 16x16 for 224px
+    - Output resolution limited to patch-grid resolution (e.g. 32x32 for 448
       input with patch_size=14). Needs bilinear upsample to full resolution.
 
     Parameters
@@ -328,7 +124,7 @@ class LinearDecoder(nn.Module):
     def __init__(self, hidden_dim: int, num_classes: int, use_layer_idx: int = -1):
         super().__init__()
         self.use_layer_idx = use_layer_idx
-        self.bn = nn.BatchNorm2d(hidden_dim)
+        #self.bn = nn.BatchNorm2d(hidden_dim)
         #self.classifier = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
 
     def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
@@ -343,7 +139,7 @@ class LinearDecoder(nn.Module):
         logits : Tensor of shape (B, num_classes, h, w)
         """
         x = features[self.use_layer_idx]
-        x = self.bn(x)
+        # x = self.bn(x)
         return x  # self.classifier(x)
 
 
@@ -355,7 +151,7 @@ class MultiScaleConcatDecoder(nn.Module):
     """
     **Strategy: concatenate features from multiple layers, then decode.**
 
-    This mirrors the *resize_concat* approach used in the official DINOv2
+    This mirrors the *resize_concat* approach used in the official MedSigLip
     segmentation notebook. Features from N selected layers are (optionally)
     resized to match the spatial size of the largest, concatenated along the
     channel dimension, and passed through a small convolutional head.
@@ -364,12 +160,12 @@ class MultiScaleConcatDecoder(nn.Module):
     ------------
     * Combines information from multiple depths (shallow texture + deep
       semantic) without complex fusion logic.
-    * Well-validated: the official DINOv2 repo ships pre-trained BNHead
+    * Well-validated: the official MedSigLip repo ships pre-trained BNHead
       weights using exactly this approach.
 
     Advantages
     ----------
-    + Simple and proven effective with DINOv2 features.
+    + Simple and proven effective with MedSigLip features.
     + Multi-layer fusion captures both low- and high-level cues.
     + Still relatively few parameters (BN + 1-2 conv layers).
 
@@ -402,17 +198,16 @@ class MultiScaleConcatDecoder(nn.Module):
     ):
         super().__init__()
         concat_dim = hidden_dim * num_layers
-        self.bn = nn.BatchNorm2d(concat_dim)
 
-        if intermediate_dim is not None:
-            self.head = nn.Sequential(
-                nn.Conv2d(concat_dim, intermediate_dim, kernel_size=1, bias=False),
-                nn.BatchNorm2d(intermediate_dim),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(intermediate_dim, hidden_dim, kernel_size=1),
-            )
-        else:
-            self.head = nn.Conv2d(concat_dim, hidden_dim, kernel_size=1)
+        # if intermediate_dim is not None:
+        #     self.head = nn.Sequential(
+        #         nn.Conv2d(concat_dim, intermediate_dim, kernel_size=1, bias=False),
+        #         nn.BatchNorm2d(intermediate_dim),
+        #         nn.ReLU(inplace=True),
+        #         nn.Conv2d(intermediate_dim, hidden_dim, kernel_size=1),
+        #     )
+        # else:
+        #     self.head = nn.Conv2d(concat_dim, hidden_dim, kernel_size=1)
 
     def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
         """
@@ -426,9 +221,174 @@ class MultiScaleConcatDecoder(nn.Module):
         """
         # All features already share the same spatial resolution.
         x = torch.cat(features, dim=1)  # (B, hidden_dim * num_layers, h, w)
-        x = self.bn(x)
-        return self.head(x)
+        # x = self.bn(x)
+        return x # self.head(x)
 
+
+class _Reassemble(nn.Module):
+    """
+    One reassemble block for a single tap.
+    Converts (B, 1+L, D) → (B, out_channels, H_out, W_out) where
+    H_out, W_out = h * scale, w * scale.
+    scale > 1 → upsample (deconv), scale < 1 → downsample (conv stride).
+    """
+    def __init__(
+        self,
+        embed_dim: int,
+        out_channels: int,
+        scale: float,                          # 0.5, 1, 2, 4
+        readout: Literal["ignore", "add", "none"] = "none",
+    ):
+        super().__init__()
+        self.readout = readout
+ 
+        # Channel projection
+        self.proj = nn.Conv2d(embed_dim, out_channels, 1, bias=False)
+ 
+        # Spatial resampler
+        if scale == 4:
+            self.resample = nn.ConvTranspose2d(out_channels, out_channels, 4, stride=4)
+        elif scale == 2:
+            self.resample = nn.ConvTranspose2d(out_channels, out_channels, 2, stride=2)
+        elif scale == 1:
+            self.resample = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        elif scale == 0.5:
+            self.resample = nn.Conv2d(out_channels, out_channels, 3, stride=2, padding=1)
+        else:
+            raise ValueError(f"Unsupported scale: {scale}")
+ 
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        if self.readout == "ignore":
+            patch_tokens = tokens[:, 1:, :]  # drop CLS
+        elif self.readout == "add":
+            patch_tokens = tokens[:, 1:, :] + tokens[:, 0:1, :]
+        else:
+            patch_tokens = tokens
+ 
+        x = self.proj(patch_tokens)           # (B, out_ch, h, w)
+        x = self.resample(x)                  # (B, out_ch, H_out, W_out)
+        return x
+
+
+class MultiScalePyramidDecoder(nn.Module):
+    """
+    **Strategy: concatenate features from multiple layers, then decode.**
+
+    This mirrors the *resize_concat* approach used in the official MedSigLip
+    segmentation notebook. Features from N selected layers are (optionally)
+    resized to match the spatial size of the largest, concatenated along the
+    channel dimension, and passed through a small convolutional head.
+
+    Why use this
+    ------------
+    * Combines information from multiple depths (shallow texture + deep
+      semantic) without complex fusion logic.
+    * Well-validated: the official MedSigLip repo ships pre-trained BNHead
+      weights using exactly this approach.
+
+    Advantages
+    ----------
+    + Simple and proven effective with MedSigLip features.
+    + Multi-layer fusion captures both low- and high-level cues.
+    + Still relatively few parameters (BN + 1-2 conv layers).
+
+    Disadvantages
+    -------------
+    - Channel dimension grows linearly with number of layers (4 layers ×
+      384 = 1536 channels for ViT-S). Can be memory-heavy for large models.
+    - All layers share the same spatial resolution, so "multi-scale" here
+      refers only to semantic depth, not spatial scale.
+    - No explicit interaction/refinement between feature levels.
+
+    Parameters
+    ----------
+    hidden_dim : int
+        Channel dimension of each backbone feature map.
+    num_layers : int
+        Number of feature maps that will be concatenated.
+    num_classes : int
+        Number of segmentation classes.
+    intermediate_dim : int or None
+        If provided, a bottleneck conv reduces channels before classification.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_layers: int,
+        image_size: int,
+        # readout: Literal["ignore", "add", "none"] = "none",
+        # has_cls: bool = False,
+        ppm_bins: Tuple[int, ...] = (1, 2, 3, 6),
+        fpn_dim: int = 256,
+    ):
+        super().__init__()
+        concat_dim = fpn_dim * num_layers
+        self.image_size = image_size
+
+        self.ppm = PyramidPoolingModule(hidden_dim, hidden_dim // 4, bins=ppm_bins)
+
+        # Lateral 1×1 convolutions
+        self.lateral_convs = nn.ModuleList(
+            [nn.Conv2d(hidden_dim, fpn_dim, kernel_size=1, bias=False) for _ in range(num_layers)]
+        )
+
+        # FPN smoothing convolutions
+        # self.smooth_convs = nn.ModuleList(
+        #     [ConvBNReLU(fpn_dim, fpn_dim) for _ in range(num_layers)]
+        # )
+
+        # Final fusion head
+        self.fusion = nn.Sequential(
+            ConvBNReLU(concat_dim, fpn_dim),
+            nn.Dropout2d(0.1),
+            nn.Conv2d(fpn_dim, fpn_dim, kernel_size=3),
+        )
+        self.pup = nn.ModuleList(
+            [nn.Sequential(
+            ConvBNReLU(fpn_dim, fpn_dim),
+            nn.Dropout2d(0.1),
+            nn.Conv2d(fpn_dim, fpn_dim, kernel_size=1),
+        ) for _ in range(3)]
+        )
+
+    def forward(
+        self, 
+        features: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        features : list[Tensor], each (B, hidden_dim, h, w)
+
+        Returns
+        -------
+        logits : (B, num_classes, h, w)
+        """
+        # All features already share the same spatial resolution.
+        #maps = [block(vit_stage) for block, vit_stage in zip(self.reassemble, features)]
+        features = list(features)  # make mutable copy
+        features[-1] = self.ppm(features[-1])
+
+        # Lateral projections
+        laterals = [conv(f) for conv, f in zip(self.lateral_convs, features)]
+
+        # Top-down pathway
+        for i in range(len(laterals) - 2, -1, -1):
+            # Same resolution, so no upsample needed — just add
+            laterals[i] = laterals[i] + laterals[i + 1]
+
+        # Concatenate and classify
+        out = torch.cat(laterals, dim=1)
+        out = self.fusion(out)
+        for pup, patch_scale in zip(self.pup, [8, 4, 2]):
+            out = F.interpolate(
+                    out, size=(self.image_size//patch_scale),
+                    mode='bilinear', align_corners=True
+            )
+            out = pup(out)
+        return out
+ 
 
 # --------------------------------------------------------------------------
 # DECODER V3: FPN-Like Decoder
@@ -438,7 +398,7 @@ class FPNLikeDecoder(nn.Module):
     """
     **Strategy: Feature Pyramid Network adapted for ViT (same-resolution).**
 
-    A classic FPN assumes multi-scale encoder outputs. Since all DINOv2 layers
+    A classic FPN assumes multi-scale encoder outputs. Since all MedSigLip layers
     output at the same resolution, we first *project* each layer to a common
     channel width (``fpn_dim``), then perform top-down lateral additions (from
     the deepest/most-semantic layer to the shallowest). Finally, all levels are
@@ -483,7 +443,6 @@ class FPNLikeDecoder(nn.Module):
         hidden_dim: int,
         num_layers: int,
         fpn_dim: int = 256,
-        num_classes: int = 21,
     ):
         super().__init__()
         # Lateral 1×1 projections (one per layer)
@@ -593,12 +552,9 @@ class UPerNetLikeDecoder(nn.Module):
         self.ppm = PyramidPoolingModule(hidden_dim, hidden_dim // 4, bins=ppm_bins)
 
         # Lateral 1×1 convolutions
-        self.lateral_convs = nn.ModuleList()
-        for i in range(num_layers):
-            in_ch = hidden_dim  # PPM output still has hidden_dim channels
-            self.lateral_convs.append(
-                nn.Conv2d(in_ch, fpn_dim, kernel_size=1, bias=False)
-            )
+        self.lateral_convs = nn.ModuleList(
+            [nn.Conv2d(hidden_dim, fpn_dim, kernel_size=1, bias=False) for _ in range(num_layers)]
+        )
 
         # FPN smoothing convolutions
         self.fpn_convs = nn.ModuleList(
@@ -644,7 +600,251 @@ class UPerNetLikeDecoder(nn.Module):
 
 
 # --------------------------------------------------------------------------
-# DECODER V5: Progressive Upsample Decoder
+# DECODER V5: UPerNet-PUP Decoder
+# --------------------------------------------------------------------------
+
+class UPerNetPUPDecoder(nn.Module):
+    """
+    **Strategy: Unified Perceptual Parsing Network adapted for ViT.**
+
+    UPerNet (Xiao et al., 2018) combines an FPN with a Pyramid Pooling Module
+    (PPM) on the deepest feature map, capturing global context before fusing
+    multi-level features. This is the decoder used by BEiT, Swin, and many
+    other ViT-based segmentation models in mmsegmentation.
+
+    Pipeline:
+    1. Apply PPM to the deepest feature map → rich global context.
+    2. FPN top-down pathway merges PPM-enhanced deep features with shallower
+       lateral features.
+    3. All levels are upsampled to the finest resolution, concatenated, and
+       passed through a classification head.
+
+    Why use this
+    ------------
+    * State-of-the-art decoder for ViT backbones in semantic segmentation.
+    * PPM captures scene-level context (important for large objects / stuff).
+    * The combination of PPM + FPN is strictly more expressive than either
+      alone.
+
+    Advantages
+    ----------
+    + Multi-scale context via PPM.
+    + Top-down feature refinement via FPN pathway.
+    + Best overall accuracy on most benchmarks with ViT backbones.
+    + Well-proven architecture with extensive ablation studies.
+
+    Disadvantages
+    -------------
+    - Heaviest decoder in this collection (most parameters and compute).
+    - More hyperparameters to tune (PPM bins, FPN dim, etc.).
+    - May overfit on small datasets — consider freezing backbone.
+
+    Parameters
+    ----------
+    hidden_dim : int
+        Backbone feature channel width.
+    num_layers : int
+        Number of feature maps from the extractor.
+    fpn_dim : int
+        Internal FPN channel width.
+    num_classes : int
+        Number of segmentation classes.
+    ppm_bins : tuple[int, ...]
+        Bin sizes for the Pyramid Pooling Module.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_layers: int,
+        fpn_dim: int = 256,
+        num_classes: int = 21,
+        ppm_bins: Tuple[int, ...] = (1, 2, 3, 6),
+    ):
+        super().__init__()
+        # PPM on the deepest feature
+        self.ppm = PyramidPoolingModule(hidden_dim, hidden_dim // 4, bins=ppm_bins)
+
+        # Lateral 1×1 convolutions
+        self.lateral_convs = nn.ModuleList(
+            [nn.Conv2d(hidden_dim, fpn_dim, kernel_size=1, bias=False) for _ in range(num_layers)]
+        )
+
+        # FPN smoothing convolutions
+        self.smooth_convs = nn.ModuleList(
+            [ConvBNReLU(fpn_dim, hidden_dim)]  # for _ in range(num_layers)]
+        )
+
+        # Final fusion head
+        self.fusion = nn.Sequential(
+            ConvBNReLU(fpn_dim * num_layers, fpn_dim),
+            nn.Dropout2d(0.1),
+            nn.Conv2d(fpn_dim, hidden_dim, kernel_size=1),
+        )
+
+    def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        features : list[Tensor], each (B, hidden_dim, h, w).
+                   Ordered shallow → deep.
+
+        Returns
+        -------
+        logits : (B, num_classes, h, w)
+        """
+        # Apply PPM to the deepest feature
+        features = list(features)  # make mutable copy
+        features[-1] = self.ppm(features[-1])
+
+        # Lateral projections
+        laterals = [conv(f) for conv, f in zip(self.lateral_convs, features)]
+
+        # Top-down pathway
+        for i in range(len(laterals) - 2, -1, -1):
+            # Same resolution, so no upsample needed — just add
+            laterals[i] = F.interpolate(
+                laterals[i + 1], scale_factor=2,
+                mode='bilinear', align_corners=True
+            ) + \
+            F.interpolate(
+                laterals[i + 1], scale_factor=2,
+                mode='bilinear', align_corners=True)
+
+        # Smoothing
+        smoothed = self.smooth_convs[0](laterals[0])
+        #smoothed = [conv(lat) for conv, lat in zip(self.smooth_convs, laterals)]
+        #print([res.shape for res in smoothed])
+
+        # Concatenate and classify
+        #out = torch.cat(smoothed, dim=1)
+        return smoothed #self.fusion(out)
+
+
+# --------------------------------------------------------------------------
+# DECODER V6: UPerNet-ConvPUP Decoder
+# --------------------------------------------------------------------------
+
+class UPerNetConvPUPDecoder(nn.Module):
+    """
+    **Strategy: Unified Perceptual Parsing Network adapted for ViT.**
+
+    UPerNet (Xiao et al., 2018) combines an FPN with a Pyramid Pooling Module
+    (PPM) on the deepest feature map, capturing global context before fusing
+    multi-level features. This is the decoder used by BEiT, Swin, and many
+    other ViT-based segmentation models in mmsegmentation.
+
+    Pipeline:
+    1. Apply PPM to the deepest feature map → rich global context.
+    2. FPN top-down pathway merges PPM-enhanced deep features with shallower
+       lateral features.
+    3. All levels are upsampled to the finest resolution, concatenated, and
+       passed through a classification head.
+
+    Why use this
+    ------------
+    * State-of-the-art decoder for ViT backbones in semantic segmentation.
+    * PPM captures scene-level context (important for large objects / stuff).
+    * The combination of PPM + FPN is strictly more expressive than either
+      alone.
+
+    Advantages
+    ----------
+    + Multi-scale context via PPM.
+    + Top-down feature refinement via FPN pathway.
+    + Best overall accuracy on most benchmarks with ViT backbones.
+    + Well-proven architecture with extensive ablation studies.
+
+    Disadvantages
+    -------------
+    - Heaviest decoder in this collection (most parameters and compute).
+    - More hyperparameters to tune (PPM bins, FPN dim, etc.).
+    - May overfit on small datasets — consider freezing backbone.
+
+    Parameters
+    ----------
+    hidden_dim : int
+        Backbone feature channel width.
+    num_layers : int
+        Number of feature maps from the extractor.
+    fpn_dim : int
+        Internal FPN channel width.
+    num_classes : int
+        Number of segmentation classes.
+    ppm_bins : tuple[int, ...]
+        Bin sizes for the Pyramid Pooling Module.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_layers: int,
+        fpn_dim: int = 256,
+        num_classes: int = 21,
+        ppm_bins: Tuple[int, ...] = (1, 2, 3, 6),
+    ):
+        super().__init__()
+        # PPM on the deepest feature
+        self.ppm = PyramidPoolingModule(hidden_dim, hidden_dim // 4, bins=ppm_bins)
+
+        # Lateral 1×1 convolutions
+        self.lateral_convs = nn.ModuleList(
+            [nn.Conv2d(hidden_dim, fpn_dim, kernel_size=1, bias=False) for _ in range(num_layers)]
+        )
+
+        # FPN smoothing convolutions
+        self.smooth_convs = nn.ModuleList(
+            [ConvBNReLU(fpn_dim, hidden_dim)]  # for _ in range(num_layers)]
+        )
+
+        # Final fusion head
+        self.fusion = nn.Sequential(
+            ConvBNReLU(fpn_dim * num_layers, fpn_dim),
+            nn.Dropout2d(0.1),
+            nn.Conv2d(fpn_dim, hidden_dim, kernel_size=1),
+        )
+
+    def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        features : list[Tensor], each (B, hidden_dim, h, w).
+                   Ordered shallow → deep.
+
+        Returns
+        -------
+        logits : (B, num_classes, h, w)
+        """
+        # Apply PPM to the deepest feature
+        features = list(features)  # make mutable copy
+        features[-1] = self.ppm(features[-1])
+
+        # Lateral projections
+        laterals = [conv(f) for conv, f in zip(self.lateral_convs, features)]
+
+        # Top-down pathway
+        for i in range(len(laterals) - 2, -1, -1):
+            # Same resolution, so no upsample needed — just add
+            laterals[i] = F.interpolate(
+                laterals[i + 1], scale_factor=2,
+                mode='bilinear', align_corners=True
+            ) + \
+            F.interpolate(
+                laterals[i + 1], scale_factor=2,
+                mode='bilinear', align_corners=True)
+
+        # Smoothing
+        smoothed = self.smooth_convs[0](laterals[0])
+        #smoothed = [conv(lat) for conv, lat in zip(self.smooth_convs, laterals)]
+        #print([res.shape for res in smoothed])
+
+        # Concatenate and classify
+        #out = torch.cat(smoothed, dim=1)
+        return smoothed #self.fusion(out)
+
+
+# --------------------------------------------------------------------------
+# DECODER VN: Progressive Upsample Decoder
 # --------------------------------------------------------------------------
 
 class ProgressiveUpsampleDecoder(nn.Module):
@@ -817,7 +1017,7 @@ class AttentionFusionDecoder(nn.Module):
     - Attention over N=4 layers is cheap, but scales O(N²) if many layers.
     - Adds architectural complexity; harder to debug than concat.
     - May not improve much over concat when backbone features are already
-      very strong (DINOv2 features are highly correlated across nearby layers).
+      very strong (MedSigLip features are highly correlated across nearby layers).
 
     Parameters
     ----------
@@ -898,261 +1098,3 @@ class AttentionFusionDecoder(nn.Module):
         fused = fused.reshape(B, h, w, self.fusion_dim).permute(0, 3, 1, 2)  # (B, D, h, w)
 
         return self.classifier(fused)
-
-
-# =============================================================================
-# 3. FULL SEGMENTATION MODEL (wrapper)
-# =============================================================================
-
-class DINOv2Segmenter(nn.Module):
-    """
-    End-to-end DINOv2 segmentation model that combines the feature extractor
-    and any decoder from above.
-
-    Parameters
-    ----------
-    extractor : DINOv2FeatureExtractor
-        Produces a list of intermediate feature maps from DINOv2.
-    decoder : nn.Module
-        Any decoder that accepts ``List[Tensor]`` and returns ``(B, C, h, w)``.
-    image_size : int or tuple[int, int]
-        Expected input image size (used to upsample logits to original resolution).
-        If None, no final upsampling is done.
-    """
-
-    def __init__(
-        self,
-        extractor: DINOv2FeatureExtractor,
-        decoder: nn.Module,
-        image_size: Optional[int] = None,
-        hidden_dim: int = 256,
-        num_classes: int = 1,
-    ):
-        super().__init__()
-        self.extractor = extractor
-        self.decoder = decoder
-        if isinstance(image_size, int):
-            self.image_size = (image_size, image_size)
-        else:
-            self.image_size = image_size
-        print(f'DINOv2Segmenter class: Encoder {extractor.__class__}, decoder {decoder.__class__}')
-
-        self.classifier = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
-
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        pixel_values : Tensor (B, 3, H, W)
-
-        Returns
-        -------
-        logits : Tensor (B, num_classes, H, W)
-            Upsampled to the original image size if ``image_size`` was set.
-        """
-        features, h, w = self.extractor(pixel_values)
-        logits = self.decoder(features)  # (B, num_classes, h', w')
-
-        # Upsample logits to the original image resolution
-        target_size = self.image_size or pixel_values.shape[2:]
-        if logits.shape[2:] != target_size:
-            logits = F.interpolate(
-                logits,
-                size=target_size,
-                mode="bilinear",
-                align_corners=False,
-            )
-        return self.classifier(logits)
-
-
-# =============================================================================
-# 4. FACTORY / CONVENIENCE CONSTRUCTORS
-# =============================================================================
-
-def build_segmenter(
-    input_channels:   int  = 1,
-    model_name: str = "facebook/dinov2-large",
-    decoder_type: str = "concat",
-    num_classes: int = 1,
-    layer_indices: Optional[List[int]] = None,
-    freeze_backbone: bool = True,
-    image_size: int = 224,
-    deep_supervision: bool = False,
-    **decoder_kwargs,
-) -> DINOv2Segmenter:
-    """
-    Factory function to build a complete DINOv2 segmentation model.
-
-    Parameters
-    ----------
-    model_name : str
-        HuggingFace model identifier.
-    decoder_type : str
-        One of: ``"linear"``, ``"concat"``, ``"fpn"``, ``"upernet"``,
-        ``"progressive"``, ``"attention"``.
-    num_classes : int
-        Number of segmentation classes.
-    layer_indices : list[int] or None
-        Transformer layer indices to extract. Defaults to evenly-spaced 4 layers.
-    freeze_backbone : bool
-        Whether to freeze the DINOv2 backbone.
-    image_size : int
-        Input image size (assumes square images).
-    **decoder_kwargs
-        Additional keyword arguments forwarded to the decoder constructor.
-    """
-    # Infer default layer indices based on model depth
-    _depth_defaults = {
-        12: [2, 5, 8, 11],
-        24: [4, 11, 17, 23],
-        40: [9, 19, 29, 39],
-    }
-
-    extractor = DINOv2FeatureExtractor(
-        input_channels=input_channels,
-        model_name=model_name,
-        layer_indices=layer_indices or [4, 11, 17, 23],  # safe default for 12-layer
-        freeze_backbone=freeze_backbone,
-        adapter=decoder_type
-    )
-
-    # Override layer indices after extractor creation if needed
-    if layer_indices is None:
-        depth = extractor.num_layers
-        if depth in _depth_defaults:
-            extractor.layer_indices = _depth_defaults[depth]
-
-    hidden_dim = extractor.hidden_dim
-    num_layers = len(extractor.layer_indices)
-
-    decoder_map = {
-        "linear": lambda: LinearDecoder(
-            hidden_dim=hidden_dim,
-            num_classes=hidden_dim,
-            **decoder_kwargs,
-        ),
-        "concat": lambda: MultiScaleConcatDecoder(
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            num_classes=hidden_dim,
-            **decoder_kwargs,
-        ),
-        "fpn": lambda: FPNLikeDecoder(
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            num_classes=hidden_dim,
-            **decoder_kwargs,
-        ),
-        "upernet": lambda: UPerNetLikeDecoder(
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            num_classes=hidden_dim,
-            **decoder_kwargs,
-        ),
-        "progressive": lambda: ProgressiveUpsampleDecoder(
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            num_classes=hidden_dim,
-            decoder_dim=hidden_dim,
-            **decoder_kwargs,
-        ),
-        "attention": lambda: AttentionFusionDecoder(
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            num_classes=hidden_dim,
-            **decoder_kwargs,
-        ),
-    }
-
-    if decoder_type not in decoder_map:
-        raise ValueError(
-            f"Unknown decoder_type '{decoder_type}'. "
-            f"Choose from: {list(decoder_map.keys())}"
-        )
-
-    decoder = decoder_map[decoder_type]()
-
-    return DINOv2Segmenter(
-        extractor=extractor,
-        decoder=decoder,
-        image_size=image_size,
-        hidden_dim=hidden_dim if decoder_type == 'concat' else hidden_dim,
-        num_classes=num_classes
-    )
-
-
-# =============================================================================
-# 5. QUICK SMOKE TEST
-# =============================================================================
-
-if __name__ == "__main__":
-    """
-    Run a shape-check smoke test with random tensors (does NOT download the
-    actual DINOv2 weights — uses random initialization for speed).
-    """
-    print("=" * 70)
-    print("DINOv2 Segmentation Decoders — Smoke Test (random weights)")
-    print("=" * 70)
-
-    def count_trainable_params(module):
-        return sum(p.numel() for p in module.parameters() if p.requires_grad)
-
-    IMAGE_SHAPE = (1, 3, 224, 224)
-    NUM_CLASSES = 2
-    HIDDEN_DIM = 1024  # ViT-L
-    NUM_LAYERS = 4
-
-    # Build extractor once (frozen backbone)
-    backbone = DINOv2FeatureExtractor(
-        model_name="facebook/dinov2-large",
-        layer_indices=[2, 5, 8, 11],
-        adapter="concat",
-        freeze_backbone=True,
-    )
-    backbone.eval()
-
-    dummy = torch.randn(*IMAGE_SHAPE)
-    with torch.no_grad():
-        features, h, w = backbone(dummy)
-
-    print(f"\nInput shape : {IMAGE_SHAPE}")
-    print(f"Patch grid  : {h}×{w}  (patch_size=14, input=224)")
-    print(f"Num features: {len(features)}  each {tuple(features[0].shape)}")
-    print(f"Backbone trainable params: {count_trainable_params(backbone):,}  (frozen → 0)\n")
-    print(f"{'Decoder':<35} {'Trainable Params':>18}  {'Output Shape'}")
-    print("-" * 70)
-
-    decoders = {
-        "LinearDecoder": LinearDecoder(
-            hidden_dim=HIDDEN_DIM, num_classes=NUM_CLASSES
-        ),
-        "MultiScaleConcatDecoder": MultiScaleConcatDecoder(
-            hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
-            num_classes=NUM_CLASSES, intermediate_dim=256
-        ),
-        "FPNLikeDecoder": FPNLikeDecoder(
-            hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
-            fpn_dim=256, num_classes=NUM_CLASSES
-        ),
-        "UPerNetLikeDecoder": UPerNetLikeDecoder(
-            hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
-            fpn_dim=256, num_classes=NUM_CLASSES
-        ),
-        "ProgressiveUpsampleDecoder": ProgressiveUpsampleDecoder(
-            hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
-            decoder_dim=256, num_classes=NUM_CLASSES
-        ),
-        "AttentionFusionDecoder": AttentionFusionDecoder(
-            hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
-            fusion_dim=256, num_heads=4, num_classes=NUM_CLASSES
-        ),
-    }
-
-    for name, decoder in decoders.items():
-        decoder.eval()
-        with torch.no_grad():
-            out = decoder(features)
-        n_params = count_trainable_params(decoder)
-        print(f"  {name:<33} {n_params:>18,}  {tuple(out.shape)}")
-
-    print("\nAll smoke tests passed ✓")
