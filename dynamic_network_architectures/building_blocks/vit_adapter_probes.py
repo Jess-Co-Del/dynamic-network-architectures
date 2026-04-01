@@ -340,15 +340,15 @@ class MultiScalePyramidDecoder(nn.Module):
 
         # Final fusion head
         self.fusion = nn.Sequential(
-            ConvBNReLU(concat_dim, fpn_dim),
+            ConvBNReLU(concat_dim, hidden_dim),
             nn.Dropout2d(0.1),
-            nn.Conv2d(fpn_dim, fpn_dim, kernel_size=3),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3),
         )
         self.pup = nn.ModuleList(
             [nn.Sequential(
-            ConvBNReLU(fpn_dim, fpn_dim),
+            ConvBNReLU(hidden_dim, hidden_dim),
             nn.Dropout2d(0.1),
-            nn.Conv2d(fpn_dim, fpn_dim, kernel_size=1),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
         ) for _ in range(3)]
         )
 
@@ -384,7 +384,7 @@ class MultiScalePyramidDecoder(nn.Module):
         for pup, patch_scale in zip(self.pup, [8, 4, 2]):
             out = F.interpolate(
                     out, size=(self.image_size//patch_scale),
-                    mode='bilinear', align_corners=True
+                    mode='bilinear', align_corners=False
             )
             out = pup(out)
         return out

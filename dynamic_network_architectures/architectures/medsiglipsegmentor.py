@@ -48,8 +48,10 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dynamic_network_architectures.building_blocks.vit_adapter_probes import *
 from transformers import AutoModel
+
+from dynamic_network_architectures.building_blocks.vit_adapter_probes import *
+from dynamic_network_architectures.building_blocks.mask2formerdecoder import Mask2Former
 
 
 # =============================================================================
@@ -244,19 +246,21 @@ class MedSigLipSegmenter(nn.Module):
         logits : Tensor (B, num_classes, H, W)
             Upsampled to the original image size if ``image_size`` was set.
         """
-        features, h, w = self.extractor(pixel_values)
-        logits = self.adapter(features)  # (B, num_classes, h', w')
+        logits, _, _ = self.extractor(pixel_values)
 
-        if self.linear_probe:
-            # Upsample logits to the original image resolution
-            target_size = self.image_size or pixel_values.shape[2:]
-            if logits.shape[2:] != target_size:
-                logits = F.interpolate(
-                    logits,
-                    size=target_size,
-                    mode="bilinear",
-                    align_corners=False,
-                )
+        if self.adapter:
+            logits = self.adapter(logits)  # (B, num_classes, h', w')
+
+            if self.linear_probe:
+                # Upsample logits to the original image resolution
+                target_size = self.image_size or pixel_values.shape[2:]
+                if logits.shape[2:] != target_size:
+                    logits = F.interpolate(
+                        logits,
+                        size=target_size,
+                        mode="bilinear",
+                        align_corners=False,
+                    )
 
         return self.decoder(logits)
 
@@ -268,7 +272,7 @@ class MedSigLipSegmenter(nn.Module):
 def build_segmenter(
     input_channels:   int  = 1,
     model_name: str = "google/medsiglip-448",
-    decoder_type: str = "concat",
+    decoder_type: str = "none",
     adapter_type: str = "concat",
     num_classes: int = 2,
     layer_indices: Optional[List[int]] = None,
@@ -369,20 +373,45 @@ def build_segmenter(
             num_classes=num_classes,
             **decoder_kwargs,
         ),
+        "none": None
     }
 
-    if decoder_type not in adapter_map:
+    decoder_map = {
+        "mask2former": lambda: Mask2Former(
+            hidden_dim=hidden_dim,
+            num_classes=num_classes,
+            patch_size=extractor.patch_size,
+            image_size=image_size,
+            **decoder_kwargs
+        ),
+        "none": None
+    }
+
+    if adapter_type not in adapter_map:
         raise ValueError(
-            f"Unknown decoder_type '{decoder_type}'. "
+            f"Unknown decoder_type '{adapter_map}'. "
             f"Choose from: {list(adapter_map.keys())}"
         )
+    elif adapter_type == 'none':
+        adapter = None
+    else:
+        adapter = adapter_map[adapter_type]()
 
-    decoder = adapter_map[adapter_type]()
+    if decoder_type not in decoder_map:
+        raise ValueError(
+            f"Unknown decoder_type '{decoder_type}'. "
+            f"Choose from: {list(decoder_map.keys())}"
+        )
+    elif decoder_type == 'none':
+        decoder = None
+    else:
+        decoder = decoder_map[decoder_type]()
 
     return MedSigLipSegmenter(
         extractor=extractor,
-        adapter=decoder,
-        decoder=None,
+        adapter=adapter,
+        decoder=decoder,
+        linear_probe=False,
         image_size=image_size,
         hidden_dim=hidden_dim*4 if adapter_type == 'concat' else hidden_dim,
         num_classes=num_classes
@@ -462,6 +491,10 @@ if __name__ == "__main__":
             hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
             fusion_dim=256, num_heads=4, num_classes=NUM_CLASSES
         ),
+        "Mask2Former": Mask2Former(
+            hidden_dim=HIDDEN_DIM, patch_size=backbone.patch_size,
+            embed_dim=256, image_size=IMAGE_SHAPE[-1], num_classes=NUM_CLASSES
+        )
     }
 
     for name, decoder in decoders.items():
