@@ -268,7 +268,7 @@ class DINOv2Segmenter(nn.Module):
             self.image_size = (image_size, image_size)
         else:
             self.image_size = image_size
-        print(f'DINOv2Segmenter class: Encoder {extractor.__class__}, decoder {decoder.__class__}')
+        print(f'DINOv2Segmenter class: Encoder {extractor.__class__}, decoder {adapter}, decoder {decoder.__class__}')
 
         if linear_probe:
             self.linear_probe = linear_probe
@@ -292,7 +292,7 @@ class DINOv2Segmenter(nn.Module):
         """
         logits, _, _ = self.extractor(pixel_values)
 
-        if self.adapter:
+        if self.adapter is not None:
             logits = self.adapter(logits)  # (B, num_classes, h', w')
 
             if self.linear_probe:
