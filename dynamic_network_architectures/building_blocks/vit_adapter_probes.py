@@ -25,26 +25,6 @@ class ConvBNReLU(nn.Module):
         return self.block(x)
 
 
-class PUP(nn.Module):
-    """
-    Progressive Uppsampling block
-    Conv2d → BatchNorm → ReLU (a ubiquitous building block)."""
-
-    def __init__(self, in_ch: int, out_ch: int, stride: int = 2, kernel_size: int = 3, padding: int = 1):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.ConvTranspose2d(in_ch, in_ch, kernel_size, stride=stride),
-            nn.Conv2d(in_ch, out_ch, kernel_size, padding=padding, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_ch, out_ch, kernel_size, padding=padding, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
-
 class PyramidPoolingModule(nn.Module):
     """
     Pyramid Pooling Module from PSPNet (Zhao et al., 2017).
@@ -600,10 +580,10 @@ class UPerNetLikeDecoder(nn.Module):
 
 
 # --------------------------------------------------------------------------
-# DECODER V5: UPerNet-PUP Decoder
+# DECODER V5: UPerNet-Interpolation PUP Decoder
 # --------------------------------------------------------------------------
 
-class UPerNetPUPDecoder(nn.Module):
+class UPerNetInterpPUPAdapter(nn.Module):
     """
     **Strategy: Unified Perceptual Parsing Network adapted for ViT.**
 
@@ -658,10 +638,12 @@ class UPerNetPUPDecoder(nn.Module):
         hidden_dim: int,
         num_layers: int,
         fpn_dim: int = 256,
-        num_classes: int = 21,
+        skip_fusion: str = 'add',  # [add | concat]
         ppm_bins: Tuple[int, ...] = (1, 2, 3, 6),
     ):
         super().__init__()
+        self.skip_fusion = skip_fusion
+
         # PPM on the deepest feature
         self.ppm = PyramidPoolingModule(hidden_dim, hidden_dim // 4, bins=ppm_bins)
 
@@ -672,14 +654,10 @@ class UPerNetPUPDecoder(nn.Module):
 
         # FPN smoothing convolutions
         self.smooth_convs = nn.ModuleList(
-            [ConvBNReLU(fpn_dim, hidden_dim)]  # for _ in range(num_layers)]
-        )
-
-        # Final fusion head
-        self.fusion = nn.Sequential(
-            ConvBNReLU(fpn_dim * num_layers, fpn_dim),
-            nn.Dropout2d(0.1),
-            nn.Conv2d(fpn_dim, hidden_dim, kernel_size=1),
+            [ConvBNReLU(
+                fpn_dim*2 if skip_fusion == 'concat' else fpn_dim,
+                hidden_dim, kernel_size=3)
+            for _ in range(num_layers)]
         )
 
     def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
@@ -691,7 +669,7 @@ class UPerNetPUPDecoder(nn.Module):
 
         Returns
         -------
-        logits : (B, num_classes, h, w)
+        multiscale_features :  list[Tensor], (B, num_classes, scale_h, scale_h) h -> h * 2, h * 4, h * 8
         """
         # Apply PPM to the deepest feature
         features = list(features)  # make mutable copy
@@ -701,31 +679,40 @@ class UPerNetPUPDecoder(nn.Module):
         laterals = [conv(f) for conv, f in zip(self.lateral_convs, features)]
 
         # Top-down pathway
-        for i in range(len(laterals) - 2, -1, -1):
-            # Same resolution, so no upsample needed — just add
-            laterals[i] = F.interpolate(
-                laterals[i + 1], scale_factor=2,
-                mode='bilinear', align_corners=True
-            ) + \
-            F.interpolate(
-                laterals[i + 1], scale_factor=2,
-                mode='bilinear', align_corners=True)
+        for i, factor in zip(range(len(laterals) - 2, -1, -1), [2, 4, 8]):
+            if self.skip_fusion == 'add':
+                laterals[i] = F.interpolate(
+                    laterals[i], scale_factor=factor,
+                    mode='bilinear', align_corners=True
+                ) + \
+                F.interpolate(
+                    laterals[i + 1], scale_factor=2,
+                    mode='bilinear', align_corners=True)
+            else:
+                    # Same resolution, concat
+                laterals[i] = torch.cat([
+                    F.interpolate(
+                        laterals[i], scale_factor=factor,
+                        mode='bilinear', align_corners=True
+                    ),
+                    F.interpolate(
+                        laterals[i + 1], scale_factor=2,
+                        mode='bilinear', align_corners=True)
+                    ],
+                    dim=1
+                )
 
         # Smoothing
-        smoothed = self.smooth_convs[0](laterals[0])
-        #smoothed = [conv(lat) for conv, lat in zip(self.smooth_convs, laterals)]
-        #print([res.shape for res in smoothed])
+        smoothed = [conv(lat) for conv, lat in zip(self.smooth_convs, laterals)]
 
-        # Concatenate and classify
-        #out = torch.cat(smoothed, dim=1)
-        return smoothed #self.fusion(out)
+        return smoothed
 
 
 # --------------------------------------------------------------------------
 # DECODER V6: UPerNet-ConvPUP Decoder
 # --------------------------------------------------------------------------
 
-class UPerNetConvPUPDecoder(nn.Module):
+class UPerNetConvPUPAdapter(nn.Module):
     """
     **Strategy: Unified Perceptual Parsing Network adapted for ViT.**
 
@@ -780,10 +767,12 @@ class UPerNetConvPUPDecoder(nn.Module):
         hidden_dim: int,
         num_layers: int,
         fpn_dim: int = 256,
-        num_classes: int = 21,
+        skip_fusion: str = 'add',  # [add | concat]
         ppm_bins: Tuple[int, ...] = (1, 2, 3, 6),
     ):
         super().__init__()
+        self.skip_fusion = skip_fusion
+
         # PPM on the deepest feature
         self.ppm = PyramidPoolingModule(hidden_dim, hidden_dim // 4, bins=ppm_bins)
 
@@ -792,16 +781,19 @@ class UPerNetConvPUPDecoder(nn.Module):
             [nn.Conv2d(hidden_dim, fpn_dim, kernel_size=1, bias=False) for _ in range(num_layers)]
         )
 
-        # FPN smoothing convolutions
-        self.smooth_convs = nn.ModuleList(
-            [ConvBNReLU(fpn_dim, hidden_dim)]  # for _ in range(num_layers)]
+        self.upsampling_up = nn.ModuleList(
+            [nn.ConvTranspose2d(fpn_dim, fpn_dim, kernel_size=2) for _ in range(num_layers)]
+        )
+        self.upsampling_skips =  nn.ModuleList(
+            [nn.ConvTranspose2d(fpn_dim, fpn_dim, kernel_size=2*(i+1)) for i in range(num_layers)]
         )
 
-        # Final fusion head
-        self.fusion = nn.Sequential(
-            ConvBNReLU(fpn_dim * num_layers, fpn_dim),
-            nn.Dropout2d(0.1),
-            nn.Conv2d(fpn_dim, hidden_dim, kernel_size=1),
+        # FPN smoothing convolutions
+        self.smooth_convs = nn.ModuleList(
+            [ConvBNReLU(
+                fpn_dim*2 if skip_fusion == 'concat' else fpn_dim,
+                hidden_dim, kernel_size=3)
+            for _ in range(num_layers)]
         )
 
     def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
@@ -813,7 +805,7 @@ class UPerNetConvPUPDecoder(nn.Module):
 
         Returns
         -------
-        logits : (B, num_classes, h, w)
+        multiscale_features :  list[Tensor], (B, num_classes, scale_h, scale_h) h -> h * 2, h * 4, h * 8
         """
         # Apply PPM to the deepest feature
         features = list(features)  # make mutable copy
@@ -823,24 +815,22 @@ class UPerNetConvPUPDecoder(nn.Module):
         laterals = [conv(f) for conv, f in zip(self.lateral_convs, features)]
 
         # Top-down pathway
-        for i in range(len(laterals) - 2, -1, -1):
-            # Same resolution, so no upsample needed — just add
-            laterals[i] = F.interpolate(
-                laterals[i + 1], scale_factor=2,
-                mode='bilinear', align_corners=True
-            ) + \
-            F.interpolate(
-                laterals[i + 1], scale_factor=2,
-                mode='bilinear', align_corners=True)
+        for i, factor in zip(range(len(laterals) - 2, -1, -1), range(0, len(laterals))):
+            if self.skip_fusion == 'add':
+                laterals[i] = self.upsampling_up[factor](laterals[i]) + \
+                    self.upsampling_skips[factor](laterals[i+1])
+            else:
+                laterals[i] = torch.cat([
+                    self.upsampling_up[factor](laterals[i]),
+                    self.upsampling_skips[factor](laterals[i+1])
+                    ],
+                    dim=1
+                )
 
         # Smoothing
-        smoothed = self.smooth_convs[0](laterals[0])
-        #smoothed = [conv(lat) for conv, lat in zip(self.smooth_convs, laterals)]
-        #print([res.shape for res in smoothed])
+        smoothed = [conv(lat) for conv, lat in zip(self.smooth_convs, laterals)]
 
-        # Concatenate and classify
-        #out = torch.cat(smoothed, dim=1)
-        return smoothed #self.fusion(out)
+        return smoothed
 
 
 # --------------------------------------------------------------------------
