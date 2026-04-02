@@ -1,5 +1,5 @@
 """
-I-JEPA + Mask2Former Decoder for Semantic/Panoptic Segmentation
+Mask2Former Decoder for Semantic/Panoptic Segmentation
 
 Architecture:
   - Backbone:       facebook/ijepa_vitg16_22k  (frozen or fine-tuned)
@@ -11,12 +11,19 @@ References:
   - Mask2Former: Cheng et al., 2022 (arXiv:2112.01527)
   - I-JEPA:      Assran et al., 2023 (arXiv:2301.08243)
 """
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModel
 from scipy.optimize import linear_sum_assignment  # Hungarian matching
+
+from transformers import Mask2FormerConfig
+from transformers.models.mask2former.modeling_mask2former import (
+    Mask2FormerPixelDecoder,          # deformable-attention pixel decoder
+    Mask2FormerTransformerModule, # the transformer decoder with masked attn
+)
+import transformers.initialization as init
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,47 +89,8 @@ class PixelDecoder(nn.Module):
             decoder_memory: list of 3 tensors at different scales
                             [(B,256,14,14), (B,256,28,28), (B,256,56,56)]
         """
-        # Project all lateral features
-        laterals = [self.lateral[i](f) for i, f in enumerate(multi_scale_features)]
-        # laterals[3] = deepest (14×14), laterals[0] = shallowest (14×14)
-        # We upsample from deep → shallow
-
-        # Top-down fusion
-        for i in range(len(laterals) - 2, -1, -1):
-            upsampled = F.interpolate(
-                laterals[i + 1],
-                size=laterals[i].shape[-2:],
-                mode='bilinear',
-                align_corners=False
-            )
-            # Double spatial resolution at each step via interpolation scale
-            # Since all ViT features are 14×14, we force resolution doubling
-            target_h = laterals[i].shape[-2] * (2 ** (len(laterals) - 2 - i))
-            target_w = laterals[i].shape[-1] * (2 ** (len(laterals) - 2 - i))
-            upsampled = F.interpolate(laterals[i + 1],
-                                      size=(target_h, target_w),
-                                      mode='bilinear', align_corners=False)
-            laterals[i] = laterals[i] + F.interpolate(
-                upsampled, size=laterals[i].shape[-2:],
-                mode='bilinear', align_corners=False
-            )
-
-        # Apply output convs with progressive upsampling
-        outs = []
-        for i, lat in enumerate(laterals):
-            scale_factor = 2 ** i  # 1×, 2×, 4×, 8×
-            upsampled = F.interpolate(lat, scale_factor=scale_factor,
-                                      mode='bilinear', align_corners=False)
-            outs.append(self.output_convs[i](upsampled))
-        # outs: [14×14, 28×28, 56×56, 112×112]
-
-        # High-res pixel embeddings for mask generation (stride-2)
-        mask_features = self.mask_features(outs[2])  # 56×56 → 112×112
-
         # Memory tensors for cross-attention: P5, P4, P3 (14, 28, 56)
-        decoder_memory = [outs[0], outs[1], outs[2]]
-
-        return mask_features, decoder_memory
+        return multi_scale_features[0], (multi_scale_features[1], multi_scale_features[2], multi_scale_features[3])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -234,42 +202,11 @@ class Mask2FormerDecoderLayer(nn.Module):
 class Mask2FormerDecoder(nn.Module):
     def __init__(
         self,
-        num_classes=150,       # ADE20K; 133 for COCO panoptic
-        num_queries=100,
-        embed_dim=256,
-        num_heads=8,
-        ffn_dim=2048,
-        num_layers=9,          # Mask2Former paper uses 9 layers
-        dropout=0.0,
-    ):
+        config: Mask2FormerConfig, backbone_out_ch: int):
         super().__init__()
-        self.num_queries = num_queries
-        self.embed_dim   = embed_dim
-        self.num_layers  = num_layers
+        self.config = config
+        self.transformer_decoder = Mask2FormerTransformerModule(in_features=backbone_out_ch, config=config)
 
-        # Learnable query embeddings (content) and query positional encodings
-        self.query_feat  = nn.Embedding(num_queries, embed_dim)
-        self.query_embed = nn.Embedding(num_queries, embed_dim)  # positional
-
-        # 9 decoder layers, cycling through 3 memory scales
-        # layer 0 → P5(14×14), layer 1 → P4(28×28), layer 2 → P3(56×56),
-        # layer 3 → P5 again, ...
-        self.layers = nn.ModuleList([
-            Mask2FormerDecoderLayer(embed_dim, num_heads, ffn_dim, dropout)
-            for _ in range(num_layers)
-        ])
-
-        # Prediction heads (shared across layers for intermediate supervision)
-        self.class_head = nn.Linear(embed_dim, num_classes + 1)   # +1 = "no object"
-        self.mask_embed = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(embed_dim, embed_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(embed_dim, embed_dim),
-        )
-
-        self.decoder_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, mask_features, multi_scale_memory):
         """
@@ -283,54 +220,17 @@ class Mask2FormerDecoder(nn.Module):
             aux_outputs: list of (logits, masks) per intermediate layer
                          used for auxiliary loss during training
         """
-        B = mask_features.shape[0]
+        
+        # Transformer decoder with masked attention
+        transformer_out = self.transformer_decoder(
+            multi_scale_features=multi_scale_memory,
+            mask_features=mask_features,
+            output_hidden_states=True,
+        )
 
-        # Initialize queries
-        queries = self.query_feat.weight.unsqueeze(0).expand(B, -1, -1)   # [B, Q, D]
-        pos_enc = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)  # [B, Q, D]
-        queries = queries + pos_enc
+        mask_logits = transformer_out.masks_queries_logits[-1]  # (B, N,H,W)
 
-        # Flatten and pre-compute pixel embeddings for mask dot-product
-        # mask_features: [B, D, 112, 112] → [B, 112*112, D]
-        B, D, Hm, Wm = mask_features.shape
-        mask_feat_flat = mask_features.view(B, D, -1).permute(0, 2, 1)   # [B, 12544, 256]
-
-        aux_outputs = []
-        prev_mask = None  # No attention mask for the first layer
-
-        for i, layer in enumerate(self.layers):
-            # Cycle through memory scales: layer 0→P5, 1→P4, 2→P3, 3→P5, ...
-            mem = multi_scale_memory[i % len(multi_scale_memory)]
-            Bm, Dm, Hk, Wk = mem.shape
-            memory_flat = mem.view(Bm, Dm, -1).permute(0, 2, 1)  # [B, H*W, D]
-
-            # Build attention mask from previous mask prediction
-            attn_mask = self._build_attention_mask(
-                prev_mask, target_hw=(Hk, Wk),
-                num_heads=8, B=B
-            ) if prev_mask is not None else None
-
-            # Run decoder layer
-            queries = layer(queries, memory_flat, attn_mask)
-
-            # Intermediate mask prediction (used as next layer's attention mask)
-            normed_q = self.decoder_norm(queries)
-            mask_emb = self.mask_embed(normed_q)              # [B, Q, D]
-            pred_mask = torch.einsum(                          # dot product
-                'bqd,bpd->bqp', mask_emb, mask_feat_flat
-            ).reshape(B, self.num_queries, Hm, Wm)            # [B, Q, 112, 112]
-
-            prev_mask = pred_mask.detach()  # stop gradient for mask → attention conversion
-
-            # Save intermediate predictions for auxiliary loss
-            pred_cls = self.class_head(normed_q)
-            aux_outputs.append({'pred_logits': pred_cls, 'pred_masks': pred_mask})
-
-        # Final predictions = last aux output
-        pred_logits = aux_outputs[-1]['pred_logits']   # [B, Q, num_classes+1]
-        pred_masks  = aux_outputs[-1]['pred_masks']    # [B, Q, 112, 112]
-
-        return pred_logits, pred_masks, aux_outputs[:-1]
+        return mask_logits
 
     @staticmethod
     def _build_attention_mask(pred_mask, target_hw, num_heads, B):
@@ -577,15 +477,22 @@ class Mask2Former(nn.Module):
         super().__init__()
 
         # ── Pixel Decoder ────────────────────────────────────────────────
-        self.pixel_decoder = PixelDecoder(in_channels=hidden_dim,
-                                          feature_dim=embed_dim)
+        self.pixel_decoder = PixelDecoder(
+            in_channels=hidden_dim,
+            feature_dim=hidden_dim
+        )
 
         # ── Transformer Decoder ──────────────────────────────────────────
+        config = make_mask2former_config(
+            num_classes=num_classes,
+            num_queries=num_queries,
+            hidden_dim=hidden_dim,
+            mask_feature_size=hidden_dim,
+            decoder_layers=9,
+        )
+
         self.transformer_decoder = Mask2FormerDecoder(
-            num_classes  = num_classes,
-            num_queries  = num_classes,
-            embed_dim    = embed_dim,
-            num_layers   = 9,
+            config, backbone_out_ch=hidden_dim
         )
 
         self.image_size = image_size
@@ -604,27 +511,20 @@ class Mask2Former(nn.Module):
         Returns (training):
             loss, loss_dict
         """
+
         # ── 1. Pixel decoder → high-res pixel embeddings + memory ────────
         mask_features, decoder_memory = self.pixel_decoder(multi_scale)
 
         # ── 2. Transformer decoder → query embeddings + mask predictions ─
-        pred_logits, pred_masks, aux_outputs = self.transformer_decoder(
+        mask_logits = self.transformer_decoder(
             mask_features, decoder_memory
         )
-
+                                                                                
         # ── 3. Upsample masks to full image resolution ───────────────────
         pred_masks_full = F.interpolate(
-            pred_masks, size=(self.image_size, self.image_size),
+            mask_logits, size=(self.image_size, self.image_size),
             mode='bilinear', align_corners=False
         )   # [B, Q, 224, 224]
-
-        if targets is not None:
-            # Training: compute loss
-            criterion = Mask2FormerLoss(
-                num_classes=self.transformer_decoder.class_head.out_features - 1)
-            loss, loss_dict = criterion(
-                pred_logits, pred_masks, aux_outputs, targets)
-            return loss, loss_dict
 
         return pred_masks_full
 
@@ -641,3 +541,236 @@ class Mask2Former(nn.Module):
         # Weighted sum: each query contributes its class prob × mask prob
         seg_logits  = torch.einsum('bqc,bqhw->bchw', class_probs, mask_probs)
         return seg_logits.argmax(dim=1)  # [B, H, W]  — per-pixel class index
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  FULL Mask2Former — Hugging Face implementation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_mask2former_config(
+    num_classes: int,
+    num_queries: int = 100,
+    hidden_dim: int = 256,
+    encoder_layers: int = 6,
+    decoder_layers: int = 9,        # paper uses 9 (3 groups × 3 scales)
+    num_attention_heads: int = 8,
+    dim_feedforward: int = 2048,
+    mask_feature_size: int = 256,
+    feature_strides: List[int] = None,
+    use_auxiliary_loss: bool = True,
+    pre_norm: bool = False,
+) -> Mask2FormerConfig:
+    """
+    Build a Mask2FormerConfig without a built-in backbone.
+    Set backbone_config=None so the HF model doesn't instantiate Swin —
+    you will feed feature maps from your own backbone directly.
+ 
+    num_classes   : number of semantic/instance classes (WITHOUT the null class;
+                    HF adds +1 internally for the "no-object" slot)
+    num_queries   : N learnable object queries (100 for COCO, 150 for ADE20K)
+    hidden_dim    : query/feature channel dimension throughout the decoder (256)
+    decoder_layers: total transformer decoder layers; must be divisible by 3
+                    because Mask2Former cycles through 3 feature scales per group
+    """
+    if feature_strides is None:
+        feature_strides = [4, 8, 16, 32]
+ 
+    cfg = Mask2FormerConfig(
+        backbone_config=None,          # ← we bring our own backbone
+        feature_size=hidden_dim,
+        mask_feature_size=mask_feature_size,
+        hidden_dim=hidden_dim,
+        encoder_feedforward_dim=dim_feedforward,
+        encoder_layers=encoder_layers,
+        decoder_layers=decoder_layers,
+        num_attention_heads=num_attention_heads,
+        dim_feedforward=dim_feedforward,
+        num_queries=num_queries,
+        use_auxiliary_loss=use_auxiliary_loss,
+        pre_norm=pre_norm,
+        feature_strides=feature_strides,
+        # loss weights (paper defaults)
+        class_weight=2.0,
+        mask_weight=5.0,
+        dice_weight=5.0,
+        no_object_weight=0.1,
+        # point sampling for efficient loss (paper: 12544 = 112×112)
+        train_num_points=12544,
+        oversample_ratio=3.0,
+        importance_sample_ratio=0.75,
+    )
+    # num_labels is set separately; HF reads it from here for the class head
+    cfg.num_labels = num_classes
+    return cfg
+
+
+class Mask2FormerDecoderHF(nn.Module):
+    """
+    HUGGINGFACE mport from transformers library.
+    """
+    def __init__(
+        self,
+        hidden_dim:   int = 1,
+        num_classes   = 3,
+        num_queries   = 3,
+        feature_size    = 256,
+        image_size    = 16,
+        deep_supervision: bool = False):
+        super().__init__()
+        
+        self.image_size = image_size
+
+        config = make_mask2former_config(
+            num_classes=num_classes,
+            num_queries=num_queries,
+            hidden_dim=feature_size,
+            decoder_layers=9,
+        )
+
+        self.decoder = Mask2FormerDecoder(config, backbone_out_ch=hidden_dim)
+
+    def forward(self, multiscale_features: List[torch.Tensor]):
+        # ── 1. Decoder ───────────────────────────────────────────────────
+        print('CHECKING', [features.shape for features in multiscale_features])
+        mask_logits = self.decoder(multiscale_features)
+        print('CHECKING', mask_logits.shape)
+        # ── 2. Upsample masks to full image resolution ───────────────────
+        pred_masks_full = F.interpolate(
+            mask_logits, size=self.image_size,
+            mode='bilinear', align_corners=False
+        )   # [B, Q, image_size, image_size]
+        return pred_masks_full
+
+
+class Mask2FormerDecoder_FromScratch(nn.Module):
+    """
+    Instantiates only the pixel decoder + transformer decoder from a config,
+    no pretrained weights.  Designed for training from scratch or fine-tuning
+    where you initialise the backbone separately.
+
+    The pixel decoder is the Mask2FormerPixelDecoder (deformable attention encoder).
+    The transformer decoder is Mask2FormerMaskedAttentionDecoder.
+
+    Parameters
+    ----------
+    config          : Mask2FormerConfig built with make_mask2former_config()
+    backbone_out_ch : channel depth of each backbone feature level
+    """
+
+    def __init__(self, config: Mask2FormerConfig, backbone_out_ch: int):
+        super().__init__()
+        self.config = config
+        C = config.feature_size       # 256 by default
+ 
+        # Input projections: backbone channels → C
+        # Mask2Former pixel decoder expects 3 scales: 1/8, 1/16, 1/32
+        self.input_proj = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(backbone_out_ch, C, 1, bias=False),
+                nn.GroupNorm(32, C),
+            )
+            for _ in range(3)   # one per scale: 1/32, 1/16, 1/8
+        ])
+ 
+        # 1/4 mask feature projection (highest resolution, no deformable attn)
+        self.mask_proj = nn.Sequential(
+            nn.Conv2d(backbone_out_ch, C, 1, bias=False),
+            nn.GroupNorm(32, C),
+        )
+ 
+        # Pixel decoder (deformable DETR encoder as multi-scale feature refiner)
+        self.pixel_decoder = Mask2FormerPixelDecoder(config, feature_channels=[C, C, C])
+ 
+        # Transformer decoder (masked attention)
+        self.transformer_decoder = Mask2FormerTransformerModule(in_features=C, config=config)
+ 
+        # Class prediction head: D → num_classes + 1
+        self.class_head = nn.Linear(C, config.num_labels + 1)
+
+    @torch.no_grad()
+    def _init_weights(self, module: nn.Module):
+        xavier_std = self.config.init_xavier_std
+        std = self.config.init_std
+
+        if isinstance(module, Mask2FormerTransformerModule):
+            if module.input_projections is not None:
+                for input_projection in module.input_projections:
+                    if not isinstance(input_projection, nn.Sequential):
+                        init.xavier_uniform_(input_projection.weight, gain=xavier_std)
+                        init.constant_(input_projection.bias, 0)
+
+        elif isinstance(module, Mask2FormerPixelDecoder):
+            init.normal_(module.level_embed, std=0)
+
+        elif isinstance(module, (nn.Linear, nn.Conv2d, nn.BatchNorm2d)):
+            init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                init.zeros_(module.bias)
+            if getattr(module, "running_mean", None) is not None:
+                init.zeros_(module.running_mean)
+                init.ones_(module.running_var)
+                init.zeros_(module.num_batches_tracked)
+
+        elif isinstance(module, (nn.LayerNorm, nn.GroupNorm)):
+            init.ones_(module.weight)
+            init.zeros_(module.bias)
+
+        elif isinstance(module, nn.Embedding):
+            init.normal_(module.weight, mean=0.0, std=std)
+            # Here we need the check explicitly, as we slice the weight in the `zeros_` call, so it looses the flag
+            if module.padding_idx is not None and not getattr(module.weight, "_is_hf_initialized", False):
+                init.zeros_(module.weight[module.padding_idx])
+
+        elif isinstance(module, Mask2FormerLoss):
+            empty_weight = torch.ones(module.num_labels + 1)
+            empty_weight[-1] = module.eos_coef
+            init.copy_(module.empty_weight, empty_weight)
+
+        if hasattr(module, "reference_points"):
+            init.xavier_uniform_(module.reference_points.weight, gain=1.0)
+            init.constant_(module.reference_points.bias, 0.0)
+
+    def forward(
+        self,
+        backbone_features: List[torch.Tensor],
+        # expected: [f_1_4, f_1_8, f_1_16, f_1_32]  finest → coarsest
+    ) -> Tuple[torch.Tensor, torch.Tensor, list]:
+        """
+        Returns
+        -------
+        class_logits : (B, N, num_classes+1)
+        mask_logits  : (B, N, H/4, W/4)
+        aux_logits   : list of (B, N, H/4, W/4) from intermediate decoder layers
+        """
+        f_1_4, f_1_8, f_1_16, f_1_32 = backbone_features
+
+        # Project each scale to C channels
+        p_1_32 = self.input_proj[0](f_1_32)
+        p_1_16 = self.input_proj[1](f_1_16)
+        p_1_8  = self.input_proj[2](f_1_8)
+        mask_features = self.mask_proj(f_1_4)   # (B, C, H/4, W/4)
+
+        # Pixel decoder: refine multi-scale features
+        # HF expects features in order [coarse, ..., fine] = [1/32, 1/16, 1/8]
+        pixel_dec_out = self.pixel_decoder(
+            features=[p_1_32, p_1_16, p_1_8],
+            output_hidden_states=False,
+        )
+        # mask_features come from the 1/4 projection, not the pixel decoder
+        # (the pixel decoder only processes 1/32..1/8 and returns refined versions)
+        multi_scale_features = pixel_dec_out.multi_scale_features
+
+        # Transformer decoder with masked attention
+        transformer_out = self.transformer_decoder(
+            multi_scale_features=multi_scale_features,
+            mask_features=mask_features,
+            output_hidden_states=True,
+        )
+
+        #queries = transformer_out.last_hidden_state          # (B, N, C)
+        #class_logits = self.class_head(queries)              # (B, N, C+1)
+        mask_logits = transformer_out.masks_queries_logits[-1]  # tuple of B Tensors shaped (N,H,W)
+        # mask_logits  = mask_logits_all[-1]                   # final layer
+        #aux_logits   = list(mask_logits_all[:-1])
+ 
+        return mask_logits

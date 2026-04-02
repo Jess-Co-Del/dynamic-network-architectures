@@ -79,7 +79,7 @@ import torch.nn.functional as F
 from transformers import AutoModel
 
 from dynamic_network_architectures.building_blocks.vit_adapter_probes import *
-from dynamic_network_architectures.building_blocks.mask2formerdecoder import Mask2Former
+from dynamic_network_architectures.building_blocks.mask2formerdecoder import Mask2Former, Mask2FormerDecoderHF
 
 
 # =============================================================================
@@ -264,11 +264,12 @@ class DINOv2Segmenter(nn.Module):
         super().__init__()
         self.extractor = extractor
         self.adapter = adapter
+        self.linear_probe = linear_probe
         if isinstance(image_size, int):
             self.image_size = (image_size, image_size)
         else:
             self.image_size = image_size
-        print(f'DINOv2Segmenter class: Encoder {extractor.__class__}, decoder {adapter}, decoder {decoder.__class__}')
+        print(f'DINOv2Segmenter class: Encoder {extractor.__class__}, adapter {adapter.__class__}, decoder {decoder.__class__}')
 
         if linear_probe:
             self.linear_probe = linear_probe
@@ -295,16 +296,18 @@ class DINOv2Segmenter(nn.Module):
         if self.adapter is not None:
             logits = self.adapter(logits)  # (B, num_classes, h', w')
 
-            if self.linear_probe:
-                # Upsample logits to the original image resolution
-                target_size = self.image_size or pixel_values.shape[2:]
-                if logits.shape[2:] != target_size:
-                    logits = F.interpolate(
-                        logits,
-                        size=target_size,
-                        mode="bilinear",
-                        align_corners=False,
-                    )
+        logits = [scale.to(torch.float32) for scale in logits]
+
+        if self.linear_probe:
+            # Upsample logits to the original image resolution
+            target_size = self.image_size or pixel_values.shape[2:]
+            if logits.shape[2:] != target_size:
+                logits = F.interpolate(
+                    logits,
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
 
         return self.decoder(logits)
 
@@ -394,6 +397,18 @@ def build_segmenter(
             num_classes=hidden_dim,
             **decoder_kwargs,
         ),
+        "upernetpupinterp": lambda: UPerNetInterpPUPAdapter(
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            skip_fusion='add',
+            **decoder_kwargs,
+        ),
+        "upernetpupconv": lambda: UPerNetConvPUPAdapter(
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            skip_fusion='add',
+            **decoder_kwargs,
+        ),
         "progressive": lambda: ProgressiveUpsampleDecoder(
             hidden_dim=hidden_dim,
             num_layers=num_layers,
@@ -415,6 +430,13 @@ def build_segmenter(
             hidden_dim=hidden_dim,
             num_classes=num_classes,
             patch_size=extractor.patch_size,
+            image_size=image_size,
+            **decoder_kwargs
+        ),
+        "mask2formerhf": lambda: Mask2FormerDecoderHF(
+            hidden_dim=hidden_dim,
+            num_classes=num_classes,
+            num_queries=num_classes,
             image_size=image_size,
             **decoder_kwargs
         ),
@@ -447,7 +469,7 @@ def build_segmenter(
         decoder=decoder,
         linear_probe=False,
         image_size=image_size,
-        hidden_dim=hidden_dim if decoder_type == 'concat' else hidden_dim,
+        hidden_dim=hidden_dim*4 if adapter_type == 'concat' else hidden_dim,
         num_classes=num_classes
     )
 

@@ -51,7 +51,7 @@ import torch.nn.functional as F
 from transformers import AutoModel
 
 from dynamic_network_architectures.building_blocks.vit_adapter_probes import *
-from dynamic_network_architectures.building_blocks.mask2formerdecoder import Mask2Former
+from dynamic_network_architectures.building_blocks.mask2formerdecoder import Mask2Former, Mask2FormerDecoderHF
 
 
 # =============================================================================
@@ -221,6 +221,8 @@ class MedSigLipSegmenter(nn.Module):
         super().__init__()
         self.extractor = extractor
         self.adapter = adapter
+        self.linear_probe = linear_probe
+        print(f'MedSigLipSegmenter class: Encoder {extractor.__class__}, adapter {adapter.__class__}, decoder {decoder.__class__}')
         if isinstance(image_size, int):
             self.image_size = (image_size, image_size)
         else:
@@ -248,19 +250,19 @@ class MedSigLipSegmenter(nn.Module):
         """
         logits, _, _ = self.extractor(pixel_values)
 
-        if self.adapter:
+        if self.adapter is not None:
             logits = self.adapter(logits)  # (B, num_classes, h', w')
 
-            if self.linear_probe:
-                # Upsample logits to the original image resolution
-                target_size = self.image_size or pixel_values.shape[2:]
-                if logits.shape[2:] != target_size:
-                    logits = F.interpolate(
-                        logits,
-                        size=target_size,
-                        mode="bilinear",
-                        align_corners=False,
-                    )
+        if self.linear_probe:
+            # Upsample logits to the original image resolution
+            target_size = self.image_size or pixel_values.shape[2:]
+            if logits.shape[2:] != target_size:
+                logits = F.interpolate(
+                    logits,
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
 
         return self.decoder(logits)
 
@@ -355,10 +357,16 @@ def build_segmenter(
             num_classes=num_classes,
             **decoder_kwargs,
         ),
-        "upernetpup": lambda: UPerNetPUPDecoder(
+        "upernetpupinterp": lambda: UPerNetInterpPUPAdapter(
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-            num_classes=num_classes,
+            skip_fusion='add',
+            **decoder_kwargs,
+        ),
+        "upernetpupconv": lambda: UPerNetConvPUPAdapter(
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            skip_fusion='add',
             **decoder_kwargs,
         ),
         "progressive": lambda: ProgressiveUpsampleDecoder(
@@ -381,6 +389,13 @@ def build_segmenter(
             hidden_dim=hidden_dim,
             num_classes=num_classes,
             patch_size=extractor.patch_size,
+            image_size=image_size,
+            **decoder_kwargs
+        ),
+        "mask2formerhf": lambda: Mask2FormerDecoderHF(
+            hidden_dim=hidden_dim,
+            num_classes=num_classes,
+            num_queries=num_classes,
             image_size=image_size,
             **decoder_kwargs
         ),
@@ -411,7 +426,7 @@ def build_segmenter(
         extractor=extractor,
         adapter=adapter,
         decoder=decoder,
-        linear_probe=False,
+        linear_probe=True if decoder is None else False,
         image_size=image_size,
         hidden_dim=hidden_dim*4 if adapter_type == 'concat' else hidden_dim,
         num_classes=num_classes
@@ -478,10 +493,6 @@ if __name__ == "__main__":
         "MultiScalePyramidDecoder": MultiScalePyramidDecoder(
             hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
             image_size=IMAGE_SHAPE[-1]
-        ),
-        "UPerNetPUPDecoder": UPerNetPUPDecoder(
-            hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
-            fpn_dim=256, num_classes=NUM_CLASSES
         ),
         "ProgressiveUpsampleDecoder": ProgressiveUpsampleDecoder(
             hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
