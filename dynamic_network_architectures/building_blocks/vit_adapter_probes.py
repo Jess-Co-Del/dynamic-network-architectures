@@ -13,10 +13,10 @@ import torch.nn.functional as F
 class ConvBNReLU(nn.Module):
     """Conv2d → BatchNorm → ReLU (a ubiquitous building block)."""
 
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1):
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, padding: int = 1, bias: bool = False):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size, padding=padding, bias=False),
+            nn.Conv2d(in_ch, out_ch, kernel_size, padding=padding, bias=bias),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
         )
