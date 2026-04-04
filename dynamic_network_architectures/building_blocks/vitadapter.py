@@ -21,26 +21,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-# ---------------------------------------------------------------------------
-# Building blocks
-# ---------------------------------------------------------------------------
-
-class ConvBNReLU(nn.Module):
-    """Conv2d → BatchNorm → ReLU helper."""
-
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3,
-                 stride: int = 1, padding: int = 1):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size, stride, padding, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
+from simple_conv_blocks import ConvBNReLU
 
 
 # ---------------------------------------------------------------------------
@@ -51,13 +32,13 @@ class SpatialPriorModule(nn.Module):
     """
     Lightweight CNN stem that produces multi-scale spatial features from the
     input image.  Outputs F1 (stride-4), F2 (stride-8), F3 (stride-16) and
-    a flattened F_sp (stride-16, projected to *embed_dim*).
+    a flattened F_sp (stride-16, projected to *hidden_dim*).
 
     The multi-scale features are later used by the extractors to recover
     spatial detail at different resolutions.
     """
 
-    def __init__(self, in_channels: int = 3, embed_dim: int = 768,
+    def __init__(self, in_channels: int = 3, hidden_dim: int = 768,
                  stem_channels: int = 64):
         super().__init__()
         # Progressive downsampling: stride 2 → 4 → 8 → 16
@@ -69,15 +50,15 @@ class SpatialPriorModule(nn.Module):
         self.downsample2 = ConvBNReLU(stem_channels, stem_channels * 2, 3, stride=2, padding=1)   # /8  → F2
         self.downsample3 = ConvBNReLU(stem_channels * 2, stem_channels * 4, 3, stride=2, padding=1)  # /16 → F3
 
-        # Project F3 to embed_dim so it matches the ViT token dimension
-        self.proj = nn.Conv2d(stem_channels * 4, embed_dim, 1)
+        # Project F3 to hidden_dim so it matches the ViT token dimension
+        self.proj = nn.Conv2d(stem_channels * 4, hidden_dim, 1)
 
     def forward(self, x: torch.Tensor):
         """
         Args:
             x: input image [B, 3, H, W]
         Returns:
-            f_sp: [B, N, embed_dim]  — flattened spatial prior tokens (stride-16)
+            f_sp: [B, N, hidden_dim]  — flattened spatial prior tokens (stride-16)
             multi_scale: list of [F1, F2, F3] feature maps at strides 4, 8, 16
         """
         x = self.stem(x)           # /2
@@ -86,9 +67,9 @@ class SpatialPriorModule(nn.Module):
         f3 = self.downsample3(f2)  # /16
 
         # Flatten F3 → sequence of tokens for cross-attention with ViT
-        f_sp = self.proj(f3)                          # [B, embed_dim, H/16, W/16]
+        f_sp = self.proj(f3)                          # [B, hidden_dim, H/16, W/16]
         B, C, H, W = f_sp.shape
-        f_sp = f_sp.flatten(2).transpose(1, 2)        # [B, N, embed_dim]
+        f_sp = f_sp.flatten(2).transpose(1, 2)        # [B, N, hidden_dim]
 
         return f_sp, [f1, f2, f3]
 
@@ -109,21 +90,21 @@ class SpatialFeatureInjector(nn.Module):
     The output is element-wise added back to F_vit^i (residual).
     """
 
-    def __init__(self, embed_dim: int = 768, num_heads: int = 8,
+    def __init__(self, hidden_dim: int = 768, num_heads: int = 8,
                  qkv_bias: bool = True, attn_drop: float = 0.0,
                  proj_drop: float = 0.0):
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.head_dim = hidden_dim // num_heads
         self.scale = self.head_dim ** -0.5
 
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
-        self.kv_proj = nn.Linear(embed_dim, embed_dim * 2, bias=qkv_bias)
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=qkv_bias)
+        self.kv_proj = nn.Linear(hidden_dim, hidden_dim * 2, bias=qkv_bias)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
-        self.norm_vit = nn.LayerNorm(embed_dim)
-        self.norm_sp = nn.LayerNorm(embed_dim)
+        self.norm_vit = nn.LayerNorm(hidden_dim)
+        self.norm_sp = nn.LayerNorm(hidden_dim)
 
     def forward(self, f_vit: torch.Tensor, f_sp: torch.Tensor) -> torch.Tensor:
         """
@@ -170,32 +151,32 @@ class MultiScaleFeatureExtractor(nn.Module):
     tokens F_sp^{i+1} are then available for the next injector.
     """
 
-    def __init__(self, embed_dim: int = 768, num_heads: int = 8,
+    def __init__(self, hidden_dim: int = 768, num_heads: int = 8,
                  mlp_ratio: float = 4.0, qkv_bias: bool = True,
                  attn_drop: float = 0.0, proj_drop: float = 0.0):
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.head_dim = hidden_dim // num_heads
         self.scale = self.head_dim ** -0.5
 
         # Cross-attention: spatial queries, ViT keys/values
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
-        self.kv_proj = nn.Linear(embed_dim, embed_dim * 2, bias=qkv_bias)
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=qkv_bias)
+        self.kv_proj = nn.Linear(hidden_dim, hidden_dim * 2, bias=qkv_bias)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        self.norm_sp = nn.LayerNorm(embed_dim)
-        self.norm_vit = nn.LayerNorm(embed_dim)
+        self.norm_sp = nn.LayerNorm(hidden_dim)
+        self.norm_vit = nn.LayerNorm(hidden_dim)
 
         # FFN
-        hidden_dim = int(embed_dim * mlp_ratio)
-        self.norm_ffn = nn.LayerNorm(embed_dim)
+        hidden_dim = int(hidden_dim * mlp_ratio)
+        self.norm_ffn = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(proj_drop),
-            nn.Linear(hidden_dim, embed_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.Dropout(proj_drop),
         )
 
@@ -237,6 +218,7 @@ class MultiScaleFeatureExtractor(nn.Module):
 # DINOv2 backbone wrapper
 # ---------------------------------------------------------------------------
 
+
 class DINOv2Backbone(nn.Module):
     """
     Wraps a DINOv2 model to expose its intermediate blocks for interleaving
@@ -262,24 +244,9 @@ class DINOv2Backbone(nn.Module):
             for p in self.dinov2.parameters():
                 p.requires_grad = False
 
-        self.embed_dim = self.dinov2.embed_dim
+        self.hidden_dim = self.dinov2.hidden_dim
         self.patch_size = self.dinov2.patch_size
         self.num_blocks = len(self.dinov2.blocks)
-
-    # Expose sub-sequences of blocks so the adapter can interleave
-    def get_block_groups(self, num_groups: int) -> List[nn.Sequential]:
-        """Split transformer blocks into `num_groups` roughly equal groups."""
-        blocks = list(self.dinov2.blocks)
-        n = len(blocks)
-        group_size = n // num_groups
-        remainder = n % num_groups
-        groups = []
-        idx = 0
-        for i in range(num_groups):
-            size = group_size + (1 if i < remainder else 0)
-            groups.append(nn.Sequential(*blocks[idx:idx + size]))
-            idx += size
-        return groups
 
     def patch_embed(self, x: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
         """
@@ -304,8 +271,9 @@ class DINOv2Backbone(nn.Module):
 
         return x, H_patches, W_patches
 
-    def _interpolate_pos_embed(self, x: torch.Tensor,
-                                H_patches: int, W_patches: int) -> torch.Tensor:
+    def _interpolate_pos_embed(
+        self, x: torch.Tensor,
+        H_patches: int, W_patches: int) -> torch.Tensor:
         """Interpolate DINOv2 position embeddings to match input resolution."""
         pos_embed = self.dinov2.pos_embed  # [1, 1+N_train, C]
         N_train = pos_embed.shape[1] - 1
@@ -359,7 +327,7 @@ class ViTAdapterDINOv2(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "dinov2_vitb14",
+        backbone: nn.Module,
         pretrained: bool = True,
         freeze_backbone: bool = False,
         num_interactions: int = 4,
@@ -371,8 +339,8 @@ class ViTAdapterDINOv2(nn.Module):
         super().__init__()
 
         # --- Backbone ---
-        self.backbone = DINOv2Backbone(model_name, pretrained, freeze_backbone)
-        embed_dim = self.backbone.embed_dim
+        self.backbone = backbone
+        hidden_dim = self.backbone.hidden_dim
         self.patch_size = self.backbone.patch_size
         self.num_interactions = num_interactions
 
@@ -383,16 +351,16 @@ class ViTAdapterDINOv2(nn.Module):
 
         # --- Spatial Prior Module ---
         self.spatial_prior = SpatialPriorModule(
-            in_channels=3, embed_dim=embed_dim, stem_channels=64
+            in_channels=3, hidden_dim=hidden_dim, stem_channels=64
         )
 
         # --- Injectors & Extractors (one per interaction) ---
         self.injectors = nn.ModuleList([
-            SpatialFeatureInjector(embed_dim, num_heads)
+            SpatialFeatureInjector(hidden_dim, num_heads)
             for _ in range(num_interactions)
         ])
         self.extractors = nn.ModuleList([
-            MultiScaleFeatureExtractor(embed_dim, num_heads, mlp_ratio)
+            MultiScaleFeatureExtractor(hidden_dim, num_heads, mlp_ratio)
             for _ in range(num_interactions)
         ])
 
@@ -404,22 +372,22 @@ class ViTAdapterDINOv2(nn.Module):
         # convolutions to produce 4 scales (stride 4, 8, 16, 32).
         self.output_proj = nn.ModuleDict({
             "scale_4": nn.Sequential(
-                nn.ConvTranspose2d(embed_dim, out_channels, kernel_size=4, stride=4),
+                nn.ConvTranspose2d(hidden_dim, out_channels, kernel_size=4, stride=4),
                 nn.BatchNorm2d(out_channels),
                 nn.ReLU(inplace=True),
             ),
             "scale_8": nn.Sequential(
-                nn.ConvTranspose2d(embed_dim, out_channels, kernel_size=2, stride=2),
+                nn.ConvTranspose2d(hidden_dim, out_channels, kernel_size=2, stride=2),
                 nn.BatchNorm2d(out_channels),
                 nn.ReLU(inplace=True),
             ),
             "scale_16": nn.Sequential(
-                nn.Conv2d(embed_dim, out_channels, 1),
+                nn.Conv2d(hidden_dim, out_channels, 1),
                 nn.BatchNorm2d(out_channels),
                 nn.ReLU(inplace=True),
             ),
             "scale_32": nn.Sequential(
-                nn.Conv2d(embed_dim, out_channels, kernel_size=2, stride=2),
+                nn.Conv2d(hidden_dim, out_channels, kernel_size=2, stride=2),
                 nn.BatchNorm2d(out_channels),
                 nn.ReLU(inplace=True),
             ),
@@ -445,8 +413,8 @@ class ViTAdapterDINOv2(nn.Module):
         B, _, H, W = x.shape
 
         # 1) DINOv2 patch + position embedding
-        f_vit, H_p, W_p = self.backbone.patch_embed(x)  # [B, 1+N, C]
-
+        f_vit = self.backbone.backbone.embeddings(x)  # [B, 1+N, C]
+  
         # 2) Spatial Prior Module
         f_sp, (f1, f2, f3) = self.spatial_prior(x)  # f_sp: [B, N_sp, C]
 
@@ -454,22 +422,25 @@ class ViTAdapterDINOv2(nn.Module):
         for i in range(self.num_interactions):
             # Inject spatial features into ViT tokens
             # We only inject into the patch tokens (skip CLS at index 0)
-            cls_token = f_vit[:, :1]
-            patch_tokens = f_vit[:, 1:]
+            cls_token = f_vit[:, :1, :]
+            patch_tokens= f_vit[:, 1:, :]  # (B, seq_len - 1, D)
+            print('prep', patch_tokens.shape, f_sp.shape)
 
             patch_tokens = self.injectors[i](patch_tokens, f_sp)
 
             f_vit = torch.cat([cls_token, patch_tokens], dim=1)
+            print('injectors', f_vit.shape)
 
             # Run ViT block group
             f_vit = self.block_groups[i](f_vit)
 
             # Extract features from ViT back to spatial branch
-            f_sp = self.extractors[i](f_sp, f_vit[:, 1:])  # skip CLS for extraction
+            f_sp = self.extractors[i](f_sp, f_vit[:, 1:, :])  # skip CLS for extraction
+            print('extractors', f_vit.shape, f_sp.shape)
 
         # 4) Reshape f_sp back to 2D spatial feature map (stride-16)
         C = f_sp.shape[-1]
-        f_sp_2d = f_sp.transpose(1, 2).reshape(B, C, H_p, W_p)  # [B, C, H/ps, W/ps]
+        f_sp_2d = f_sp.transpose(1, 2).reshape(B, C, H // self.patch_size, W // self.patch_size)  # [B, C, H/ps, W/ps]
 
         # 5) Produce multi-scale outputs + fuse with CNN lateral features
         out_s4 = self.output_proj["scale_4"](f_sp_2d) + self.lateral_f1(f1)
@@ -484,9 +455,17 @@ class ViTAdapterDINOv2(nn.Module):
 # Convenience constructors
 # ---------------------------------------------------------------------------
 
+from dynamic_network_architectures.architectures.dinosegmentor import DINOv2FeatureExtractor
+
+backbone = DINOv2FeatureExtractor(
+        layer_indices=[6, 13, 19, 23],
+        adapter="all",
+        freeze_backbone=True,
+        )
+
 def vit_adapter_dinov2_small(**kwargs) -> ViTAdapterDINOv2:
     """ViT-Adapter with DINOv2-S/14 backbone (384-dim, 6 heads)."""
-    defaults = dict(model_name="dinov2_vits14", num_heads=6)
+    defaults = dict(backbone=backbone, num_heads=6)
     defaults.update(kwargs)
     return ViTAdapterDINOv2(**defaults)
 
@@ -500,7 +479,7 @@ def vit_adapter_dinov2_base(**kwargs) -> ViTAdapterDINOv2:
 
 def vit_adapter_dinov2_large(**kwargs) -> ViTAdapterDINOv2:
     """ViT-Adapter with DINOv2-L/14 backbone (1024-dim, 16 heads)."""
-    defaults = dict(model_name="dinov2_vitl14", num_heads=16)
+    defaults = dict(backbone=backbone, num_heads=16)
     defaults.update(kwargs)
     return ViTAdapterDINOv2(**defaults)
 
@@ -517,7 +496,7 @@ if __name__ == "__main__":
 
     # Build model (use small for quick testing)
     print("Building ViT-Adapter with DINOv2-S/14 ...")
-    model = vit_adapter_dinov2_small(
+    model = vit_adapter_dinov2_large(
         pretrained=True,
         freeze_backbone=True,
         num_interactions=4,
@@ -531,7 +510,7 @@ if __name__ == "__main__":
     print(f"Trainable params: {trainable / 1e6:.1f}M")
 
     # Dummy forward pass (DINOv2 patch_size=14, use 224×224)
-    dummy = torch.randn(2, 3, 518, 518).to(device)  # 518 = 14 * 37
+    dummy = torch.randn(2, 3, 224, 224).to(device)  # 224 = 14 * 16
     print(f"\nInput shape: {dummy.shape}")
 
     with torch.no_grad():
