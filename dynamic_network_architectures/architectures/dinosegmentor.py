@@ -80,7 +80,8 @@ from transformers import AutoModel
 
 from dynamic_network_architectures.building_blocks.vit_adapter_probes import *
 from dynamic_network_architectures.building_blocks.mask2formerdecoder import Mask2Former, Mask2FormerDecoderHF
-
+from dynamic_network_architectures.building_blocks.unetr_decoder import UNETRDecoder
+from dynamic_network_architectures.building_blocks.upernet_decoder import UPerNetDecoder
 
 # =============================================================================
 # 1. FEATURE EXTRACTOR — wraps HuggingFace DINOv2 and returns intermediate maps
@@ -230,6 +231,21 @@ class DINOv2FeatureExtractor(nn.Module):
 
         return features, h, w
 
+    # Expose sub-sequences of blocks so the adapter can interleave
+    # Prepared for interleaved layer input injection
+    def get_block_groups(self, num_groups: int) -> List[nn.Sequential]:
+        """Split transformer blocks into `num_groups` roughly equal groups."""
+        blocks = list(self.backbone.encoder.layer)
+        n = len(blocks)
+        group_size = n // num_groups
+        remainder = n % num_groups
+        groups = []
+        idx = 0
+        for i in range(num_groups):
+            size = group_size + (1 if i < remainder else 0)
+            groups.append(nn.Sequential(*blocks[idx:idx + size]))
+            idx += size
+        return groups
 
 # =============================================================================
 # 3. FULL SEGMENTATION MODEL (wrapper)
@@ -309,7 +325,7 @@ class DINOv2Segmenter(nn.Module):
                     align_corners=False,
                 )
 
-        return self.decoder(logits)
+        return self.decoder(logits, pixel_values)
 
 
 # =============================================================================
@@ -440,6 +456,18 @@ def build_segmenter(
             image_size=image_size,
             **decoder_kwargs
         ),
+        "unetr": lambda: UNETRDecoder(
+            hidden_dim=hidden_dim,
+            num_classes=num_classes,
+            input_channels=1,
+            image_size=image_size,
+        ),
+        "upernet": lambda: UPerNetDecoder(
+            hidden_dim=hidden_dim,
+            num_classes=num_classes,
+            #input_channels=1,
+            image_size=image_size,
+        ),
         "none": None
     }
 
@@ -525,7 +553,7 @@ if __name__ == "__main__":
         ),
         "FPNLikeDecoder": FPNLikeDecoder(
             hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
-            fpn_dim=256, num_classes=NUM_CLASSES
+            fpn_dim=256
         ),
         "UPerNetLikeDecoder": UPerNetLikeDecoder(
             hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
@@ -539,12 +567,21 @@ if __name__ == "__main__":
             hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
             fusion_dim=256, num_heads=4, num_classes=NUM_CLASSES
         ),
+        "UnetRDecoder": UNETRDecoder(
+            hidden_dim=HIDDEN_DIM,
+            num_classes=NUM_CLASSES,
+            input_channels=3,
+            image_size=IMAGE_SHAPE[2:],
+        ),
     }
 
     for name, decoder in decoders.items():
         decoder.eval()
         with torch.no_grad():
-            out = decoder(features)
+            if isinstance(decoder, UNETRDecoder):
+                out = decoder(features, dummy)
+            else:
+                out = decoder(features)
         n_params = count_trainable_params(decoder)
         print(f"  {name:<33} {n_params:>18,}  {tuple(out.shape)}")
 
