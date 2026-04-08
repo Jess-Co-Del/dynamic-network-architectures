@@ -82,6 +82,7 @@ from dynamic_network_architectures.building_blocks.vit_adapter_probes import *
 from dynamic_network_architectures.building_blocks.mask2formerdecoder import Mask2Former, Mask2FormerDecoderHF
 from dynamic_network_architectures.building_blocks.unetr_decoder import UNETRDecoder
 from dynamic_network_architectures.building_blocks.upernet_decoder import UPerNetDecoder
+from dynamic_network_architectures.building_blocks.vitadapter import ViTAdapterDINOv2
 
 # =============================================================================
 # 1. FEATURE EXTRACTOR — wraps HuggingFace DINOv2 and returns intermediate maps
@@ -379,6 +380,14 @@ def build_segmenter(
         freeze_backbone=freeze_backbone,
         adapter=decoder_type
     )
+    if adapter_type == 'vitadapter':
+        extractor = ViTAdapterDINOv2(
+            backbone=extractor,
+            hidden_dim=hidden_dim,
+            num_classes=num_classes,
+            #input_channels=1,
+            image_size=image_size,
+        )
 
     # Override layer indices after extractor creation if needed
     if layer_indices is None:
@@ -438,7 +447,8 @@ def build_segmenter(
             num_classes=hidden_dim,
             **decoder_kwargs,
         ),
-        "none": None
+        "none": None,
+        "vitadapter": None
     }
 
     decoder_map = {

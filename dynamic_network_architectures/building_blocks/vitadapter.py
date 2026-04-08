@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from simple_conv_blocks import ConvBNReLU
+from torch.nn.init import normal_
 
 
 # ---------------------------------------------------------------------------
@@ -45,13 +46,18 @@ class SpatialPriorModule(nn.Module):
         self.stem = nn.Sequential(
             ConvBNReLU(in_channels, stem_channels, 3, stride=2, padding=1),      # /2
             ConvBNReLU(stem_channels, stem_channels, 3, stride=1, padding=1),
+            ConvBNReLU(stem_channels, stem_channels, 3, stride=1, padding=1),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)                     # /2
         )
-        self.downsample1 = ConvBNReLU(stem_channels, stem_channels, 3, stride=2, padding=1)      # /4  → F1
-        self.downsample2 = ConvBNReLU(stem_channels, stem_channels * 2, 3, stride=2, padding=1)   # /8  → F2
-        self.downsample3 = ConvBNReLU(stem_channels * 2, stem_channels * 4, 3, stride=2, padding=1)  # /16 → F3
+        self.downsample1 = ConvBNReLU(stem_channels, stem_channels * 2, 3, stride=2, padding=1)      # /8  → F1
+        self.downsample2 = ConvBNReLU(stem_channels * 2, stem_channels * 4, 3, stride=2, padding=1)   # /16  → F2
+        self.downsample3 = ConvBNReLU(stem_channels * 4, stem_channels * 4, 3, stride=2, padding=1)  # /32 → F3
 
         # Project F3 to hidden_dim so it matches the ViT token dimension
-        self.proj = nn.Conv2d(stem_channels * 4, hidden_dim, 1)
+        self.proj1 = nn.Conv2d(stem_channels, hidden_dim, 1)
+        self.proj2 = nn.Conv2d(stem_channels*2, hidden_dim, 1)
+        self.proj3 = nn.Conv2d(stem_channels * 4, hidden_dim, 1)
+        self.proj4 = nn.Conv2d(stem_channels * 4, hidden_dim, 1)
 
     def forward(self, x: torch.Tensor):
         """
@@ -61,17 +67,22 @@ class SpatialPriorModule(nn.Module):
             f_sp: [B, N, hidden_dim]  — flattened spatial prior tokens (stride-16)
             multi_scale: list of [F1, F2, F3] feature maps at strides 4, 8, 16
         """
-        x = self.stem(x)           # /2
-        f1 = self.downsample1(x)   # /4
-        f2 = self.downsample2(f1)  # /8
-        f3 = self.downsample3(f2)  # /16
+        x = self.stem(x)           # /4
+        f1 = self.downsample1(x)   # /8
+        f2 = self.downsample2(f1)  # /16
+        f3 = self.downsample3(f2)  # /32
 
         # Flatten F3 → sequence of tokens for cross-attention with ViT
-        f_sp = self.proj(f3)                          # [B, hidden_dim, H/16, W/16]
-        B, C, H, W = f_sp.shape
-        f_sp = f_sp.flatten(2).transpose(1, 2)        # [B, N, hidden_dim]
+        f_s0 = self.proj1(x)
+        f_s3 = self.proj4(f3)                          # [B, hidden_dim, H/8, W/8]
+        f_s2 = self.proj3(f2)                          # [B, hidden_dim, H/16, W/16]
+        f_s1 = self.proj2(f1)                          # [B, hidden_dim, H/32, W/32]
 
-        return f_sp, [f1, f2, f3]
+        f_s3 = f_s3.flatten(2).transpose(1, 2)        # [B, N, hidden_dim]
+        f_s2 = f_s2.flatten(2).transpose(1, 2)        # [B, N, hidden_dim]
+        f_s1 = f_s1.flatten(2).transpose(1, 2)        # [B, N, hidden_dim]
+
+        return f_s0, f_s1, f_s2, f_s3
 
 
 # ---------------------------------------------------------------------------
@@ -151,9 +162,11 @@ class MultiScaleFeatureExtractor(nn.Module):
     tokens F_sp^{i+1} are then available for the next injector.
     """
 
-    def __init__(self, hidden_dim: int = 768, num_heads: int = 8,
-                 mlp_ratio: float = 4.0, qkv_bias: bool = True,
-                 attn_drop: float = 0.0, proj_drop: float = 0.0):
+    def __init__(
+        self,
+        hidden_dim: int = 768, num_heads: int = 8,
+        mlp_ratio: float = 4.0, qkv_bias: bool = True,
+        attn_drop: float = 0.0, proj_drop: float = 0.0):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
@@ -170,7 +183,6 @@ class MultiScaleFeatureExtractor(nn.Module):
         self.norm_vit = nn.LayerNorm(hidden_dim)
 
         # FFN
-        hidden_dim = int(hidden_dim * mlp_ratio)
         self.norm_ffn = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -217,7 +229,6 @@ class MultiScaleFeatureExtractor(nn.Module):
 # ---------------------------------------------------------------------------
 # DINOv2 backbone wrapper
 # ---------------------------------------------------------------------------
-
 
 class DINOv2Backbone(nn.Module):
     """
@@ -328,8 +339,8 @@ class ViTAdapterDINOv2(nn.Module):
     def __init__(
         self,
         backbone: nn.Module,
-        pretrained: bool = True,
-        freeze_backbone: bool = False,
+        in_channels: int = 3,
+        add_vit_feature: bool = True,
         num_interactions: int = 4,
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
@@ -343,15 +354,17 @@ class ViTAdapterDINOv2(nn.Module):
         hidden_dim = self.backbone.hidden_dim
         self.patch_size = self.backbone.patch_size
         self.num_interactions = num_interactions
-
+        self.add_vit_feature = add_vit_feature
         # Split backbone blocks into groups
         self.block_groups = nn.ModuleList(
             self.backbone.get_block_groups(num_interactions)
         )
 
         # --- Spatial Prior Module ---
+        self.sp_embed = nn.Parameter(torch.zeros(3, hidden_dim))
+        normal_(self.sp_embed)
         self.spatial_prior = SpatialPriorModule(
-            in_channels=3, hidden_dim=hidden_dim, stem_channels=64
+            in_channels=in_channels, hidden_dim=hidden_dim, stem_channels=out_channels
         )
 
         # --- Injectors & Extractors (one per interaction) ---
@@ -367,37 +380,43 @@ class ViTAdapterDINOv2(nn.Module):
         # --- Output projections: reshape spatial tokens → 2D feature maps ---
         # Produce multi-scale outputs at strides 4, 8, 16, 32 (like an FPN)
         self.out_indices = out_indices or list(range(num_interactions))
-
+        
+        # uPSAMPLE LAST MULTI-scale
+        self.upsample_sp0 = nn.ConvTranspose2d(hidden_dim, hidden_dim, 2, 2)
+        self.norm1 = nn.SyncBatchNorm(hidden_dim)
+        self.norm2 = nn.SyncBatchNorm(hidden_dim)
+        self.norm3 = nn.SyncBatchNorm(hidden_dim)
+        self.norm4 = nn.SyncBatchNorm(hidden_dim)
         # We reshape the final f_sp back to 2D at stride-16, then use
         # convolutions to produce 4 scales (stride 4, 8, 16, 32).
-        self.output_proj = nn.ModuleDict({
-            "scale_4": nn.Sequential(
-                nn.ConvTranspose2d(hidden_dim, out_channels, kernel_size=4, stride=4),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True),
-            ),
-            "scale_8": nn.Sequential(
-                nn.ConvTranspose2d(hidden_dim, out_channels, kernel_size=2, stride=2),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True),
-            ),
-            "scale_16": nn.Sequential(
-                nn.Conv2d(hidden_dim, out_channels, 1),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True),
-            ),
-            "scale_32": nn.Sequential(
-                nn.Conv2d(hidden_dim, out_channels, kernel_size=2, stride=2),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True),
-            ),
-        })
+        # self.output_proj = nn.ModuleDict({
+        #     "scale_4": nn.Sequential(
+        #         nn.ConvTranspose2d(hidden_dim, out_channels, kernel_size=4, stride=4),
+        #         nn.BatchNorm2d(out_channels),
+        #         nn.ReLU(inplace=True),
+        #     ),
+        #     "scale_8": nn.Sequential(
+        #         nn.ConvTranspose2d(hidden_dim, out_channels, kernel_size=2, stride=2),
+        #         nn.BatchNorm2d(out_channels),
+        #         nn.ReLU(inplace=True),
+        #     ),
+        #     "scale_16": nn.Sequential(
+        #         nn.Conv2d(hidden_dim, out_channels, 1),
+        #         nn.BatchNorm2d(out_channels),
+        #         nn.ReLU(inplace=True),
+        #     ),
+        #     "scale_32": nn.Sequential(
+        #         nn.Conv2d(hidden_dim, out_channels, kernel_size=2, stride=2),
+        #         nn.BatchNorm2d(out_channels),
+        #         nn.ReLU(inplace=True),
+        #     ),
+        # })
 
         # Lateral connections to fuse CNN multi-scale features (F1, F2, F3)
         # with the reshaped spatial prior tokens
-        self.lateral_f1 = nn.Conv2d(64, out_channels, 1)    # stride-4
-        self.lateral_f2 = nn.Conv2d(128, out_channels, 1)   # stride-8
-        self.lateral_f3 = nn.Conv2d(256, out_channels, 1)   # stride-16
+        # self.lateral_f1 = nn.Conv2d(64, out_channels, 1)    # stride-4
+        # self.lateral_f2 = nn.Conv2d(128, out_channels, 1)   # stride-8
+        # self.lateral_f3 = nn.Conv2d(256, out_channels, 1)   # stride-16
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """
@@ -411,44 +430,80 @@ class ViTAdapterDINOv2(nn.Module):
                scale_32: B×C×H/32×W/32]
         """
         B, _, H, W = x.shape
+        H_toks, W_toks = H // self.patch_size, W // self.patch_size
 
         # 1) DINOv2 patch + position embedding
-        f_vit = self.backbone.backbone.embeddings(x)  # [B, 1+N, C]
-  
-        # 2) Spatial Prior Module
-        f_sp, (f1, f2, f3) = self.spatial_prior(x)  # f_sp: [B, N_sp, C]
+        f_vit = self.backbone.backbone.embeddings(x)  # [B, 1+N, D]
+        D = f_vit.size(-1)
+        f_s0, f_s1, f_s2, f_s3 = self.spatial_prior(x)
+ 
+        # Record spatial sizes for use in reshape later (BUG 1 FIX: derived
+        # from the actual feature map size, not from patch_size constants)
+        H4, W4  = H // 4,  W // 4    # stride-4
+        H8, W8  = H // 8,  W // 8    # stride-8
+        H16, W16 = H // 16, W // 16   # stride-16
+        H32, W32 = H // 32, W // 32   # stride-32
+ 
+        # Add learnable level embeddings and concatenate into one sequence
+        f_s1 = f_s1 + self.sp_embed[0]
+        f_s2 = f_s2 + self.sp_embed[1]
+        f_s3 = f_s3 + self.sp_embed[2]
+        f_sp = torch.cat([f_s1, f_s2, f_s3], dim=1)   # (B, N_8+N_16+N_32, D)
+ 
 
         # 3) Interleaved injection / ViT blocks / extraction
+        outs = list()
         for i in range(self.num_interactions):
             # Inject spatial features into ViT tokens
             # We only inject into the patch tokens (skip CLS at index 0)
             cls_token = f_vit[:, :1, :]
             patch_tokens= f_vit[:, 1:, :]  # (B, seq_len - 1, D)
-            print('prep', patch_tokens.shape, f_sp.shape)
 
             patch_tokens = self.injectors[i](patch_tokens, f_sp)
 
             f_vit = torch.cat([cls_token, patch_tokens], dim=1)
-            print('injectors', f_vit.shape)
 
             # Run ViT block group
             f_vit = self.block_groups[i](f_vit)
 
             # Extract features from ViT back to spatial branch
             f_sp = self.extractors[i](f_sp, f_vit[:, 1:, :])  # skip CLS for extraction
-            print('extractors', f_vit.shape, f_sp.shape)
+            outs.append(f_vit[:, 1:, :].transpose(1, 2).view(B, D, H_toks, W_toks).contiguous())
 
-        # 4) Reshape f_sp back to 2D spatial feature map (stride-16)
-        C = f_sp.shape[-1]
-        f_sp_2d = f_sp.transpose(1, 2).reshape(B, C, H // self.patch_size, W // self.patch_size)  # [B, C, H/ps, W/ps]
+        # 4) Reshape f_sp back to 2D spatial feature maps
+        extracted_sp2 = f_sp[:, 0: f_s1.size(1), :]
+        extracted_sp3 = f_sp[:, f_s1.size(1): f_s1.size(1) + f_s2.size(1), :]
+        extracted_sp4 = f_sp[:, f_s1.size(1) + f_s2.size(1):, :]
 
-        # 5) Produce multi-scale outputs + fuse with CNN lateral features
-        out_s4 = self.output_proj["scale_4"](f_sp_2d) + self.lateral_f1(f1)
-        out_s8 = self.output_proj["scale_8"](f_sp_2d) + self.lateral_f2(f2)
-        out_s16 = self.output_proj["scale_16"](f_sp_2d) + self.lateral_f3(f3)
-        out_s32 = self.output_proj["scale_32"](f_sp_2d)
+        sp_8 = extracted_sp2.transpose(1, 2).view(
+            B, D, H8, W8).contiguous()
+        sp_16 = extracted_sp3.transpose(1, 2).view(
+            B, D, H16,W16).contiguous()
+        sp_32 = extracted_sp4.transpose(1, 2).view(
+            B, D, H32, W32).contiguous()  # [B, C, H/ps, W/ps]
+        sp_4 = self.upsample_sp0(sp_8) + f_s0
 
-        return [out_s4, out_s8, out_s16, out_s32]
+        # 5) Produce multi-scale outputs + fuse with CNN lateral features  (stride-14)
+        if self.add_vit_feature:
+            x1, x2, x3, x4 = outs
+            sp_4 += F.interpolate(x1, size=(H4, W4), mode='bilinear', align_corners=False)
+            sp_8 = sp_8 + F.interpolate(x2, size=(H8, W8), mode='bilinear', align_corners=False)
+            sp_16 = sp_16 + F.interpolate(x3, size=(H16, W16), mode='bilinear', align_corners=False)
+            sp_32 = sp_32 + F.interpolate(x4, size=(H32, W32), mode='bilinear', align_corners=False)
+
+        # Final Norm
+        f1 = self.norm1(sp_4)
+        f2 = self.norm2(sp_8)
+        f3 = self.norm3(sp_16)
+        f4 = self.norm4(sp_32)
+        return [f1, f2, f3, f4]
+
+        # out_s4 = self.output_proj["scale_4"](f_sp_2d) + self.lateral_f1(f1)
+        # out_s8 = self.output_proj["scale_8"](f_sp_2d) + self.lateral_f2(f2)
+        # out_s16 = self.output_proj["scale_16"](f_sp_2d) + self.lateral_f3(f3)
+        # out_s32 = self.output_proj["scale_32"](f_sp_2d)
+
+        # return [out_s4, out_s8, out_s16, out_s32]
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +515,6 @@ from dynamic_network_architectures.architectures.dinosegmentor import DINOv2Feat
 backbone = DINOv2FeatureExtractor(
         layer_indices=[6, 13, 19, 23],
         adapter="all",
-        freeze_backbone=True,
         )
 
 def vit_adapter_dinov2_small(**kwargs) -> ViTAdapterDINOv2:
@@ -497,8 +551,6 @@ if __name__ == "__main__":
     # Build model (use small for quick testing)
     print("Building ViT-Adapter with DINOv2-S/14 ...")
     model = vit_adapter_dinov2_large(
-        pretrained=True,
-        freeze_backbone=True,
         num_interactions=4,
         out_channels=256,
     ).to(device)
@@ -521,4 +573,10 @@ if __name__ == "__main__":
         stride = [4, 8, 16, 32][i]
         print(f"  stride-{stride:2d}: {feat.shape}")
 
+    spm = SpatialPriorModule(in_channels=3, hidden_dim=256).to(device)
+    with torch.no_grad():
+        multiscales = spm(dummy)
+
+    print("\nSpatial prior Module output shapes:")
+    print(f"  SPM-{[feat.shape for feat in multiscales]}")
     print("\nDone!")
