@@ -19,7 +19,7 @@ class ConvBNReLU(nn.Module):
         in_ch: int, out_ch: int,
         kernel_size: int = 3,
         stride: int = 1,
-        padding: int = 1,
+        padding: int = 0,
         bias=True
     ):
         super().__init__()

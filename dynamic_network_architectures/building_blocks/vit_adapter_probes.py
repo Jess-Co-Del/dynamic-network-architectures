@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple, Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .simple_conv_blocks import ConvBNReLU
+from dynamic_network_architectures.building_blocks.simple_conv_blocks import ConvBNReLU
 
 
 class PyramidPoolingModule(nn.Module):

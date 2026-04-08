@@ -21,7 +21,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from simple_conv_blocks import ConvBNReLU
+from dynamic_network_architectures.building_blocks.simple_conv_blocks import ConvBNReLU
 from torch.nn.init import normal_
 
 
@@ -432,6 +432,9 @@ class ViTAdapterDINOv2(nn.Module):
         B, _, H, W = x.shape
         H_toks, W_toks = H // self.patch_size, W // self.patch_size
 
+        # 1) Package DINOv2 applies preprocessing
+        if callable(self.backbone._preprocess):
+            x = self.backbone._preprocess(x)
         # 1) DINOv2 patch + position embedding
         f_vit = self.backbone.backbone.embeddings(x)  # [B, 1+N, D]
         D = f_vit.size(-1)
@@ -496,7 +499,7 @@ class ViTAdapterDINOv2(nn.Module):
         f2 = self.norm2(sp_8)
         f3 = self.norm3(sp_16)
         f4 = self.norm4(sp_32)
-        return [f1, f2, f3, f4]
+        return [f1, f2, f3, f4], H, W
 
         # out_s4 = self.output_proj["scale_4"](f_sp_2d) + self.lateral_f1(f1)
         # out_s8 = self.output_proj["scale_8"](f_sp_2d) + self.lateral_f2(f2)
@@ -510,12 +513,11 @@ class ViTAdapterDINOv2(nn.Module):
 # Convenience constructors
 # ---------------------------------------------------------------------------
 
-from dynamic_network_architectures.architectures.dinosegmentor import DINOv2FeatureExtractor
 
-backbone = DINOv2FeatureExtractor(
-        layer_indices=[6, 13, 19, 23],
-        adapter="all",
-        )
+# backbone = DINOv2FeatureExtractor(
+#         layer_indices=[6, 13, 19, 23],
+#         adapter="all",
+#         )
 
 def vit_adapter_dinov2_small(**kwargs) -> ViTAdapterDINOv2:
     """ViT-Adapter with DINOv2-S/14 backbone (384-dim, 6 heads)."""

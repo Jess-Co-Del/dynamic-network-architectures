@@ -80,7 +80,7 @@ from transformers import AutoModel
 
 from dynamic_network_architectures.building_blocks.vit_adapter_probes import *
 from dynamic_network_architectures.building_blocks.mask2formerdecoder import Mask2Former, Mask2FormerDecoderHF
-from dynamic_network_architectures.building_blocks.unetr_decoder import UNETRDecoder
+from dynamic_network_architectures.building_blocks.unetr_decoder import UNETRDecoder, UNETRFPNDecoder
 from dynamic_network_architectures.building_blocks.upernet_decoder import UPerNetDecoder
 from dynamic_network_architectures.building_blocks.vitadapter import ViTAdapterDINOv2
 
@@ -380,14 +380,6 @@ def build_segmenter(
         freeze_backbone=freeze_backbone,
         adapter=decoder_type
     )
-    if adapter_type == 'vitadapter':
-        extractor = ViTAdapterDINOv2(
-            backbone=extractor,
-            hidden_dim=hidden_dim,
-            num_classes=num_classes,
-            #input_channels=1,
-            image_size=image_size,
-        )
 
     # Override layer indices after extractor creation if needed
     if layer_indices is None:
@@ -397,6 +389,16 @@ def build_segmenter(
 
     hidden_dim = extractor.hidden_dim
     num_layers = len(extractor.layer_indices)
+
+    # Preparing Adapter 
+    if adapter_type == 'vitadapter':
+        extractor = ViTAdapterDINOv2(
+            backbone=extractor,
+            in_channels=3,
+            num_heads=16,  # For ViT 1024
+            num_interactions=4,
+            out_channels=256
+        )
 
     adapter_map = {
         "linear": lambda: LinearDecoder(
@@ -478,6 +480,12 @@ def build_segmenter(
             #input_channels=1,
             image_size=image_size,
         ),
+        "unetrfpn": lambda: UNETRFPNDecoder(
+            input_channels=1,
+            hidden_dim=hidden_dim,
+            image_size=image_size,
+            num_classes=num_classes,
+        ),
         "none": None
     }
 
@@ -486,7 +494,7 @@ def build_segmenter(
             f"Unknown decoder_type '{adapter_map}'. "
             f"Choose from: {list(adapter_map.keys())}"
         )
-    elif adapter_type == 'none':
+    elif adapter_type in ['none', 'vitadapter']:
         adapter = None
     else:
         adapter = adapter_map[adapter_type]()
