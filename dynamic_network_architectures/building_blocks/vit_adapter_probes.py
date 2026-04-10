@@ -85,7 +85,7 @@ class LinearDecoder(nn.Module):
         Which feature in the list to use (default -1 = last).
     """
 
-    def __init__(self, hidden_dim: int, num_classes: int, use_layer_idx: int = -1):
+    def __init__(self, hidden_dim: int, use_layer_idx: Optional[int] = None):
         super().__init__()
         self.use_layer_idx = use_layer_idx
         #self.bn = nn.BatchNorm2d(hidden_dim)
@@ -102,9 +102,10 @@ class LinearDecoder(nn.Module):
         -------
         logits : Tensor of shape (B, num_classes, h, w)
         """
-        x = features[self.use_layer_idx]
-        # x = self.bn(x)
-        return x  # self.classifier(x)
+        if self.use_layer_idx is not None:
+            features = features[self.use_layer_idx]
+        #features = self.bn(features)
+        return features  # self.classifier(x)
 
 
 # --------------------------------------------------------------------------
@@ -157,21 +158,16 @@ class MultiScaleConcatDecoder(nn.Module):
         self,
         hidden_dim: int,
         num_layers: int,
-        num_classes: int,
         intermediate_dim: Optional[int] = None,
     ):
         super().__init__()
         concat_dim = hidden_dim * num_layers
 
-        # if intermediate_dim is not None:
-        #     self.head = nn.Sequential(
-        #         nn.Conv2d(concat_dim, intermediate_dim, kernel_size=1, bias=False),
-        #         nn.BatchNorm2d(intermediate_dim),
-        #         nn.ReLU(inplace=True),
-        #         nn.Conv2d(intermediate_dim, hidden_dim, kernel_size=1),
-        #     )
-        # else:
-        #     self.head = nn.Conv2d(concat_dim, hidden_dim, kernel_size=1)
+        self.head = nn.Sequential(
+        nn.Conv2d(concat_dim, intermediate_dim, kernel_size=1, bias=False),
+        nn.BatchNorm2d(intermediate_dim),
+        nn.ReLU(inplace=True),
+        )
 
     def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
         """
@@ -186,7 +182,7 @@ class MultiScaleConcatDecoder(nn.Module):
         # All features already share the same spatial resolution.
         x = torch.cat(features, dim=1)  # (B, hidden_dim * num_layers, h, w)
         # x = self.bn(x)
-        return x # self.head(x)
+        return self.head(x)
 
 
 class _Reassemble(nn.Module):

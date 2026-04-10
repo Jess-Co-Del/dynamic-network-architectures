@@ -235,7 +235,12 @@ class DINOv2FeatureExtractor(nn.Module):
     # Expose sub-sequences of blocks so the adapter can interleave
     # Prepared for interleaved layer input injection
     def get_block_groups(self, num_groups: int) -> List[nn.Sequential]:
-        """Split transformer blocks into `num_groups` roughly equal groups."""
+        """
+        Split transformer blocks into `num_groups` roughly equal groups.
+        Dont forget to pass by:
+            - first inputs go through self.backbone.embeddings(x)
+            - after these blocks outputs fo through self.backbone.layernorm(f_vit)
+        """
         blocks = list(self.backbone.encoder.layer)
         n = len(blocks)
         group_size = n // num_groups
@@ -397,7 +402,8 @@ def build_segmenter(
             in_channels=3,
             num_heads=16,  # For ViT 1024
             num_interactions=4,
-            out_channels=256
+            out_channels=256,
+            image_size=image_size
         )
 
     adapter_map = {

@@ -458,27 +458,27 @@ class UNETRFPNDecoder(nn.Module):
         """
         assert len(pyramid) == 4, \
             f"Expected exactly 4 FPN levels [P2,P3,P4,P5], got {len(pyramid)}"
- 
+
         if image_hw is None:
             image_hw = self.image_size
- 
+
         P2, P3, P4, P5 = pyramid   # finest → coarsest
 
         # ── Image-level skip ─────────────────────────────────────────────
         image_skip = self.inputconv(inputs)   # (B, F, H, W)
- 
+
         # ── Project each FPN level to decoder channel widths ─────────────
         s0 = self.skip_proj[0](P2)   # (B, F,  H/4,  W/4)
         s1 = self.skip_proj[1](P3)   # (B, 2F, H/8,  W/8)
         s2 = self.skip_proj[2](P4)   # (B, 4F, H/16, W/16)
         s3 = self.skip_proj[3](P5)   # (B, 8F, H/32, W/32)
- 
+
         # ── Decoder: coarse → fine ────────────────────────────────────────
         #
         # Stage 0: bottleneck upsample
         #   (B, 8F, H/32, W/32) → (B, 8F, H/16, W/16)
         x = self.deconv0(s3)
- 
+
         # Stage 1: merge with P4 skip (already at H/16), then upsample
         #   skip s2: (B, 4F, H/16, W/16)   — no realignment needed
         #   main  x: (B, 8F, H/16, W/16)
@@ -486,7 +486,7 @@ class UNETRFPNDecoder(nn.Module):
         #   → deconv: (B, 4F, H/8, W/8)
         x = self.merge1(s2, x)
         x = self.deconv1(x)
- 
+
         # Stage 2: merge with P3 skip (already at H/8), then upsample
         #   skip s1: (B, 2F, H/8, W/8)
         #   main  x: (B, 4F, H/8, W/8)
@@ -494,7 +494,7 @@ class UNETRFPNDecoder(nn.Module):
         #   → deconv: (B, 2F, H/4, W/4)
         x = self.merge2(s1, x)
         x = self.deconv2(x)
- 
+
         # Stage 3: merge with P2 skip (already at H/4), then upsample
         #   skip s0: (B, F, H/4, W/4)
         #   main  x: (B, 2F, H/4, W/4)
@@ -502,20 +502,20 @@ class UNETRFPNDecoder(nn.Module):
         #   → deconv: (B, F, H/2, W/2)
         x = self.merge3(s0, x)
         x = self.deconv3(x)
- 
+
         # ── Upsample to full resolution and merge with image skip ─────────
         # x is at (H/2, W/2) after the 4 deconv stages.
         # We upsample to (H, W) before the final merge so the image-level
         # skip and decoder path are at the same resolution.
         x = F.interpolate(x, size=image_hw, mode="bilinear", align_corners=False)
         x = self.mergefinal(image_skip, x)
- 
+
         # ── Head ──────────────────────────────────────────────────────────
         x      = self.dropout(x)
         logits = self.head(x)   # (B, num_classes, H, W)
         return logits
  
-    # ──────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 

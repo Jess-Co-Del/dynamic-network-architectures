@@ -222,7 +222,7 @@ class MedSigLipSegmenter(nn.Module):
         self.extractor = extractor
         self.adapter = adapter
         self.linear_probe = linear_probe
-        print(f'MedSigLipSegmenter class: Encoder {extractor.__class__}, adapter {adapter.__class__}, decoder {decoder.__class__}')
+        print(f'MedSigLipSegmenter class: Encoder {extractor.__class__}, adapter {adapter.__class__} + linear_probe {linear_probe}, decoder {decoder.__class__}')
         if isinstance(image_size, int):
             self.image_size = (image_size, image_size)
         else:
@@ -331,7 +331,6 @@ def build_segmenter(
     adapter_map = {
         "linear": lambda: LinearDecoder(
             hidden_dim=hidden_dim,
-            num_classes=num_classes,
             **decoder_kwargs,
         ),
         "concat": lambda: MultiScaleConcatDecoder(
