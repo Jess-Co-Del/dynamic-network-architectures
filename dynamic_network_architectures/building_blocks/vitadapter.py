@@ -159,12 +159,12 @@ class AdapterDWConv(nn.Module):
     def forward(self, x):
         B, N, C = x.shape
         n = N // 21
-        x1 = x[:, 0:self.sp_scales[0]**2, :].transpose(1, 2).view(
-            B, C, self.sp_scales[0], self.sp_scales[0]).contiguous()
-        x2 = x[:, self.sp_scales[0]**2:self.sp_scales[0]**2 + self.sp_scales[1]**2, :].transpose(1, 2).view(
-            B, C, self.sp_scales[1], self.sp_scales[1]).contiguous()
-        x3 = x[:, self.sp_scales[0]**2 + self.sp_scales[1]**2:, :].transpose(1, 2).view(
-            B, C, self.sp_scales[2], self.sp_scales[2]).contiguous()
+        x1 = x[:, 0:self.sp_scales[0]**2, :].permute(0, 2, 1).reshape(
+            B, C, self.sp_scales[0], self.sp_scales[0])
+        x2 = x[:, self.sp_scales[0]**2:self.sp_scales[0]**2 + self.sp_scales[1]**2, :].permute(0, 2, 1).reshape(
+            B, C, self.sp_scales[1], self.sp_scales[1])
+        x3 = x[:, self.sp_scales[0]**2 + self.sp_scales[1]**2:, :].permute(0, 2, 1).reshape(
+            B, C, self.sp_scales[2], self.sp_scales[2])
         x1 = self.dwconv(x1).flatten(2).transpose(1, 2)
         x2 = self.dwconv(x2).flatten(2).transpose(1, 2)
         x3 = self.dwconv(x3).flatten(2).transpose(1, 2)
@@ -379,6 +379,7 @@ class ViTAdapterDINOv2(nn.Module):
         self.patch_size = self.backbone.patch_size
         self.num_interactions = num_interactions
         self.add_vit_feature = add_vit_feature
+        self.image_size = image_size
         self.H_toks, self.W_toks = image_size // self.patch_size, image_size // self.patch_size
 
         # Split backbone blocks into groups
@@ -467,8 +468,13 @@ class ViTAdapterDINOv2(nn.Module):
         # 1) Package DINOv2 applies preprocessing
         if callable(self.backbone._preprocess):
             x = self.backbone._preprocess(x)
-        # 1) DINOv2 patch + position embedding
+        # 1) DINOv2 patch + position embedding + 1st blocks
         f_vit = self.backbone.backbone.embeddings(x)  # [B, 1+N, D]
+        # Run first ViT blocks group
+        f_vit = self.block_groups[0](f_vit)
+        patch_tokens= f_vit[:, 1:, :]  # (B, seq_len - 1, D)
+
+        # 2) Prepare Spatial Pooling pyramid
         D = f_vit.size(-1)
         f_s0_base, f_s1, f_s2 = self.spatial_prior(x)
 
@@ -481,54 +487,62 @@ class ViTAdapterDINOv2(nn.Module):
 
         # 3) Interleaved injection / ViT blocks / extraction
         outs = list()
-        for i in range(self.num_interactions):
-            # Inject spatial features into ViT tokens
-            # We only inject into the patch tokens (skip CLS at index 0)
-            cls_token = f_vit[:, :1, :]
-            patch_tokens= f_vit[:, 1:, :]  # (B, seq_len - 1, D)
+        outs.append(
+                f_vit[:, 1:, :].permute(0, 2, 1).reshape(B, -1, self.H_toks, self.W_toks)
+        )
+        for i in range(1, self.num_interactions):
 
             # Extract features from ViT back to spatial branch
             #print(f_sp.shape)
             f_sp_i = self.extractors[i](f_sp, patch_tokens)  # skip CLS for extraction
             f_sp = f_sp + f_sp_i
 
-            patch_tokens = self.injectors[i](patch_tokens, f_sp)
-
-            f_vit_i = torch.cat([cls_token, patch_tokens], dim=1)
-            f_vit = f_vit + f_vit_i
-
             # Run ViT block group
             f_vit = self.block_groups[i](f_vit)
-            f_vit = self.backbone.backbone.layernorm(f_vit)
 
-            outs.append(f_vit[:, 1:, :].transpose(1, 2).view(B, D, self.H_toks, self.W_toks).contiguous())
+            # Inject spatial features into ViT tokens
+            # We only inject into the patch tokens (skip CLS at index 0)
+            cls_token = f_vit[:, :1, :]
+            patch_tokens= f_vit[:, 1:, :]  # (B, seq_len - 1, D)
+            patch_tokens = self.injectors[i](patch_tokens, f_sp)
+
+            f_vit = torch.cat([cls_token, patch_tokens], dim=1)
+            #f_vit = f_vit + f_vit_i
+
+            outs.append(
+                f_vit[:, 1:, :].permute(0, 2, 1).reshape(B, -1, self.H_toks, self.W_toks) \
+                    if i < self.num_interactions-1 else \
+                self.backbone.backbone.layernorm(f_vit)[:, 1:, :].permute(0, 2, 1).reshape(B, -1, self.H_toks, self.W_toks)
+            )
 
         # 4) Reshape f_sp back to 2D spatial feature maps
         extracted_sp2 = f_sp[:, 0: f_s0.size(1), :]
         extracted_sp3 = f_sp[:, f_s0.size(1): f_s0.size(1) + f_s1.size(1), :]
         extracted_sp4 = f_sp[:, f_s0.size(1) + f_s1.size(1):, :]
 
-        sp_2 = extracted_sp2.transpose(1, 2).view(
-            B, D, self.sp_scales[0], self.sp_scales[0]).contiguous()
-        sp_8 = extracted_sp3.transpose(1, 2).view(
-            B, D,self.sp_scales[1], self.sp_scales[1]).contiguous()
-        sp_16 = extracted_sp4.transpose(1, 2).view(
-            B, D, self.sp_scales[2], self.sp_scales[2]).contiguous()  # [B, C, H/ps, W/ps]
+        sp_2 = extracted_sp2.permute(0, 2, 1).reshape(
+            B, D, self.sp_scales[0], self.sp_scales[0])
+        sp_8 = extracted_sp3.permute(0, 2, 1).reshape(
+            B, D,self.sp_scales[1], self.sp_scales[1])
+        sp_16 = extracted_sp4.permute(0, 2, 1).reshape(
+            B, D, self.sp_scales[2], self.sp_scales[2])  # [B, C, H/ps, W/ps]
 
         # 5) Produce multi-scale outputs + fuse with CNN lateral features  (stride-14)
         if self.add_vit_feature:
             x1, x2, x3, x4 = outs
-            #sp_8 = sp_8 + F.interpolate(x2, size=(H8, W8), mode='bilinear', align_corners=False)
-            #sp_16 = sp_16 + F.interpolate(x3, size=(H16, W16), mode='bilinear', align_corners=False)
-            #sp_32 = sp_32 + F.interpolate(x4, size=(H32, W32), mode='bilinear', align_corners=False)
+            sp_0 = sp_0 + F.interpolate(x1, size=(self.image_size, self.image_size), mode='bilinear', align_corners=False)
+            sp_2 = sp_2 + F.interpolate(x2, size=(self.sp_scales[0], self.sp_scales[0]), mode='bilinear', align_corners=False)
+            sp_8 = sp_8 + F.interpolate(x3, size=(self.sp_scales[1], self.sp_scales[1]), mode='bilinear', align_corners=False)
+            sp_16 = sp_16 + F.interpolate(x4, size=(self.sp_scales[2], self.sp_scales[2]), mode='bilinear', align_corners=False)
 
         # Final Norm
-        f1 = self.norm2(sp_2)
-        f2 = self.norm3(sp_8)
-        f3 = self.norm4(sp_16)
-        spatial_embeddings = [f_s0_base.transpose(1, 2).view(
-            B, D, self.sp_scales[0], self.sp_scales[0]).contiguous(), f1, f2, f3]
-        return outs, H, W
+        f1 = self.norm1(sp_0)
+        f2 = self.norm2(sp_2)
+        f3 = self.norm3(sp_8)
+        f4 = self.norm4(sp_16)
+        # spatial_embeddings = [f_s0_base.transpose(1, 2).view(
+        #     B, D, self.sp_scales[0], self.sp_scales[0]).contiguous(), f1, f2, f3]
+        return [f1, f2, f3, f4], H, W
 
 
 

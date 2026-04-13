@@ -243,14 +243,11 @@ class DINOv2FeatureExtractor(nn.Module):
         """
         blocks = list(self.backbone.encoder.layer)
         n = len(blocks)
-        group_size = n // num_groups
-        remainder = n % num_groups
+
         groups = []
-        idx = 0
-        for i in range(num_groups):
-            size = group_size + (1 if i < remainder else 0)
-            groups.append(nn.Sequential(*blocks[idx:idx + size]))
-            idx += size
+        groups.append(nn.Sequential(*blocks[0: self.layer_indices[0]+1]))
+        for i in range(num_groups-1):
+            groups.append(nn.Sequential(*blocks[self.layer_indices[i]+1:self.layer_indices[i+1]+1]))
         return groups
 
 # =============================================================================
