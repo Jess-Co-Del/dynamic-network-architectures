@@ -52,6 +52,7 @@ from transformers import AutoModel
 
 from dynamic_network_architectures.building_blocks.vit_adapter_probes import *
 from dynamic_network_architectures.building_blocks.mask2formerdecoder import Mask2Former, Mask2FormerDecoderHF
+from dynamic_network_architectures.building_blocks.unetr_decoder import UNETRDecoder, UNETRFPNDecoder
 
 
 # =============================================================================
@@ -264,7 +265,7 @@ class MedSigLipSegmenter(nn.Module):
                     align_corners=False,
                 )
 
-        return self.decoder(logits)
+        return self.decoder(logits, pixel_values)
 
 
 # =============================================================================
@@ -380,6 +381,7 @@ def build_segmenter(
             num_classes=num_classes,
             **decoder_kwargs,
         ),
+        'vitadapter': None,
         "none": None
     }
 
@@ -398,6 +400,18 @@ def build_segmenter(
             image_size=image_size,
             **decoder_kwargs
         ),
+        "unetr": lambda: UNETRDecoder(
+            input_channels=1,
+            hidden_dim=hidden_dim,
+            image_size=image_size,
+            num_classes=num_classes,
+        ),
+        "unetrfpn": lambda: UNETRFPNDecoder(
+            input_channels=1,
+            hidden_dim=hidden_dim,
+            image_size=image_size,
+            num_classes=num_classes,
+        ),
         "none": None
     }
 
@@ -406,7 +420,7 @@ def build_segmenter(
             f"Unknown decoder_type '{adapter_map}'. "
             f"Choose from: {list(adapter_map.keys())}"
         )
-    elif adapter_type == 'none':
+    elif adapter_type in ['none', 'vitadapter']:
         adapter = None
     else:
         adapter = adapter_map[adapter_type]()
@@ -475,11 +489,11 @@ if __name__ == "__main__":
 
     decoders = {
         "LinearDecoder": LinearDecoder(
-            hidden_dim=HIDDEN_DIM, num_classes=NUM_CLASSES
+            hidden_dim=HIDDEN_DIM
         ),
         "MultiScaleConcatDecoder": MultiScaleConcatDecoder(
             hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
-            num_classes=NUM_CLASSES, intermediate_dim=256
+            intermediate_dim=256
         ),
         "FPNLikeDecoder": FPNLikeDecoder(
             hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
@@ -501,6 +515,10 @@ if __name__ == "__main__":
             hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
             fusion_dim=256, num_heads=4, num_classes=NUM_CLASSES
         ),
+        "UPerNetPUPDecoder": UPerNetConvPUPAdapter(
+            hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
+            skip_fusion='add'
+        ),
         "Mask2Former": Mask2Former(
             hidden_dim=HIDDEN_DIM, patch_size=backbone.patch_size,
             embed_dim=256, image_size=IMAGE_SHAPE[-1], num_classes=NUM_CLASSES
@@ -512,6 +530,9 @@ if __name__ == "__main__":
         with torch.no_grad():
             out = decoder(features)
         n_params = count_trainable_params(decoder)
-        print(f"  {name:<33} {n_params:>18,}  {tuple(out.shape)}")
+        if isinstance(out, list):
+            print(f"  {name:<33} {n_params:>18,}  {[tuple(ot.shape) for ot in out]}")
+        else:
+            print(f"  {name:<33} {n_params:>18,}  {tuple(out.shape)}")
 
     print("\nAll smoke tests passed ✓")

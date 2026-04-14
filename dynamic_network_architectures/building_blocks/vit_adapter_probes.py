@@ -762,17 +762,17 @@ class UPerNetConvPUPAdapter(nn.Module):
         )
 
         self.upsampling_up = nn.ModuleList(
-            [nn.ConvTranspose2d(fpn_dim, fpn_dim, kernel_size=2) for _ in range(num_layers)]
+            [nn.ConvTranspose2d(fpn_dim, fpn_dim, kernel_size=2**(i+1), stride=2**(i+1)) for i in range(num_layers)]
         )
         self.upsampling_skips =  nn.ModuleList(
-            [nn.ConvTranspose2d(fpn_dim, fpn_dim, kernel_size=2*(i+1)) for i in range(num_layers)]
+            [nn.ConvTranspose2d(fpn_dim, fpn_dim, kernel_size=2, stride=2) for i in range(num_layers)]
         )
 
         # FPN smoothing convolutions
         self.smooth_convs = nn.ModuleList(
             [ConvBNReLU(
                 fpn_dim*2 if skip_fusion == 'concat' else fpn_dim,
-                hidden_dim, kernel_size=3)
+                hidden_dim, kernel_size=3, padding=1)
             for _ in range(num_layers)]
         )
 
@@ -793,9 +793,11 @@ class UPerNetConvPUPAdapter(nn.Module):
 
         # Lateral projections
         laterals = [conv(f) for conv, f in zip(self.lateral_convs, features)]
+        #print([latera.shape for latera in laterals])
 
         # Top-down pathway
         for i, factor in zip(range(len(laterals) - 2, -1, -1), range(0, len(laterals))):
+            print(i, [latera.shape for latera in laterals])
             if self.skip_fusion == 'add':
                 laterals[i] = self.upsampling_up[factor](laterals[i]) + \
                     self.upsampling_skips[factor](laterals[i+1])
