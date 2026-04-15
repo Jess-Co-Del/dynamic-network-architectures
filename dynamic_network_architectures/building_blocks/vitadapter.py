@@ -1134,6 +1134,7 @@ class DINOv2FeatureExtractor(nn.Module):
 
     def embeddings(self, x):
         x = self.encoder.patch_embed(x)
+        # Torch hub does not come with CLS token
         x = torch.cat([x, torch.zeros([x.shape[0], 1, x.shape[2]]).to(x.device)], dim=1)
         return x
 
