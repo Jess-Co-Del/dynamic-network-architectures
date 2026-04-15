@@ -109,7 +109,7 @@ class DINOv2FeatureExtractor(nn.Module):
         self,
         input_channels:   int  = 1,
         model_name: str = "facebook/dinov2-large",
-        layer_indices: List[int] = [1, 10, 20, 23],  # Total 25 blocks
+        layer_indices: List[int] = [1, 10, 20, 23],  # Total 24 blocks
         adapter: str = 'last',
         freeze_backbone: bool = True,
     ):
@@ -133,9 +133,9 @@ class DINOv2FeatureExtractor(nn.Module):
         else:
             self.layer_indices = sorted(layer_indices)
             for idx in self.layer_indices:
-                if idx < 0 or idx >= self.num_layers:
+                if idx < 0 or idx > self.num_layers:
                     raise ValueError(
-                        f"layer_index {idx} out of range [0, {self.num_layers - 1}]"
+                        f"layer_index {idx} out of range [0, {self.num_layers}]"
                     )
 
         self.register_buffer(
@@ -234,7 +234,7 @@ class DINOv2FeatureExtractor(nn.Module):
 
     # Expose sub-sequences of blocks so the adapter can interleave
     # Prepared for interleaved layer input injection
-    def get_block_groups(self, num_groups: int) -> List[nn.Sequential]:
+    def get_block_groups(self) -> List[nn.Sequential]:
         """
         Split transformer blocks into `num_groups` roughly equal groups.
         Dont forget to pass by:
@@ -242,7 +242,7 @@ class DINOv2FeatureExtractor(nn.Module):
             - after these blocks outputs fo through self.backbone.layernorm(f_vit)
         """
         blocks = list(self.backbone.encoder.layer)
-        n = len(blocks)
+        num_groups = len(self.layer_indices)
 
         groups = []
         groups.append(nn.Sequential(*blocks[0: self.layer_indices[0]+1]))
@@ -310,7 +310,7 @@ class DINOv2Segmenter(nn.Module):
         logits : Tensor (B, num_classes, H, W)
             Upsampled to the original image size if ``image_size`` was set.
         """
-        logits, _, _ = self.extractor(pixel_values)
+        logits= self.extractor(pixel_values)
 
         if self.adapter is not None:
             logits = self.adapter(logits)  # (B, num_classes, h', w')
@@ -370,15 +370,15 @@ def build_segmenter(
     """
     # Infer default layer indices based on model depth
     _depth_defaults = {
-        12: [2, 5, 8, 11],
-        24: [4, 11, 17, 23],
-        40: [9, 19, 29, 39],
+        12: [2, 5, 8, 12],
+        24: [5, 11, 17, 24],
+        40: [9, 19, 29, 40],
     }
 
     extractor = DINOv2FeatureExtractor(
         input_channels=input_channels,
         model_name=model_name,
-        layer_indices=layer_indices or [4, 11, 17, 23],  # safe default for 12-layer
+        layer_indices=layer_indices or [5, 11, 17, 24],  # safe default for 24-layer
         freeze_backbone=freeze_backbone,
         adapter=decoder_type
     )
