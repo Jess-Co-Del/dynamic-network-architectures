@@ -188,6 +188,23 @@ class MedSigLipFeatureExtractor(nn.Module):
 
         return features, h, w
 
+    # Expose sub-sequences of blocks so the adapter can interleave
+    # Prepared for interleaved layer input injection
+    def get_block_groups(self) -> List[nn.Sequential]:
+        """
+        Split transformer blocks into `num_groups` roughly equal groups.
+        Dont forget to pass by:
+            - first inputs go through self.backbone.embeddings(x)
+            - after these blocks outputs fo through self.backbone.layernorm(f_vit)
+        """
+        blocks = list(self.backbone.encoder.layer)
+        num_groups = len(self.layer_indices)
+
+        groups = []
+        groups.append(nn.Sequential(*blocks[0: self.layer_indices[0]+1]))
+        for i in range(num_groups-1):
+            groups.append(nn.Sequential(*blocks[self.layer_indices[i]+1:self.layer_indices[i+1]+1]))
+        return groups
 
 # =============================================================================
 # 3. FULL SEGMENTATION MODEL (wrapper)
