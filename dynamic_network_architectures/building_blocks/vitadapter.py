@@ -904,6 +904,7 @@ class ViTAdapterDINOv2(nn.Module):
         self.norm2 = nn.SyncBatchNorm(hidden_dim)
         self.norm3 = nn.SyncBatchNorm(hidden_dim)
         self.norm4 = nn.SyncBatchNorm(hidden_dim)
+
         self.up.apply(self._init_weights)
         self.spm.apply(self._init_weights)
         self.interactions.apply(self._init_weights)
@@ -960,7 +961,6 @@ class ViTAdapterDINOv2(nn.Module):
         # 1) DINOv2 patch + position embedding + 1st blocks
         x = self.backbone.backbone.embeddings(x)  # [B, 1+N, D]
 
-        # print("H_toks, W_toks =", H_toks, W_toks)
         bs, n, dim = x.shape
 
         # Interaction
@@ -992,11 +992,16 @@ class ViTAdapterDINOv2(nn.Module):
                     H_toks,
                     W_toks,
                 )
-            outs.append(
-                x.transpose(1, 2).view(bs, dim, H_toks, W_toks).contiguous() \
-                    if i < self.num_interactions-1 else \
-                self.backbone.backbone.layernorm(x).transpose(1, 2).view(bs, dim, H_toks, W_toks).contiguous()
-                )
+            if hasattr(self.backbone.backbone, 'layernorm'):
+                outs.append(
+                    x.transpose(1, 2).view(bs, dim, H_toks, W_toks).contiguous() \
+                        if i < self.num_interactions-1 else \
+                    self.backbone.backbone.layernorm(x).transpose(1, 2).view(bs, dim, H_toks, W_toks).contiguous()
+                    )
+            else:  # Used on the simplified backbone for tests
+                outs.append(
+                    x.transpose(1, 2).view(bs, dim, H_toks, W_toks).contiguous()
+                    )
         # # Run first ViT blocks group
         # f_vit = self.block_groups[0](f_vit)
         # patch_tokens= f_vit[:, 1:, :]  # (B, seq_len - 1, D)
@@ -1074,32 +1079,107 @@ class ViTAdapterDINOv2(nn.Module):
 # ---------------------------------------------------------------------------
 # Convenience constructors
 # ---------------------------------------------------------------------------
+from transformers import AutoModel
 
-# from dynamic_network_architectures.architectures.dinosegmentor import DINOv2FeatureExtractor
-# backbone = DINOv2FeatureExtractor(
-#         layer_indices=[6, 13, 19, 23],
-#         adapter="all",
-#         )
+class DINOv2FeatureExtractor(nn.Module):
+    def __init__(
+        self,
+        model_name: str = 'dinov2_vitb14',
+        layer_indices: list = [5,12,18,24],
+        freeze_backbone: bool = True
+    ):
+        super().__init__()
+        self.encoder = torch.hub.load('facebookresearch/dinov2', model_name)
+        self.layer_indices = layer_indices
+        if freeze_backbone:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
 
-def vit_adapter_dinov2_small(**kwargs) -> ViTAdapterDINOv2:
+        self.patch_size: int = self.encoder.patch_size
+        self.hidden_dim: int = self.encoder.embed_dim
+        self.layernorm = nn.LayerNorm(self.hidden_dim)
+
+        self.register_buffer(
+            "pixel_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "pixel_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+        )
+        self.backbone = lambda: None
+        self.backbone.embeddings = partial(self.embeddings)
+        self.backbone.layernorm = partial(self.layernorm)
+
+    def _preprocess(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        Tile grayscale → 3-ch if needed, then apply ImageNet normalization.
+
+        Args:
+            pixel_values: [B, C, H, W] with values in [0, 1].
+
+        Returns:
+            Normalized [B, 3, H, W] tensor.
+        """
+        # Tile grayscale → 3-ch if needed
+        if pixel_values.shape[1] == 1:
+            pixel_values = pixel_values.repeat(1, 3, 1, 1)
+
+        # Normalize to range [0,1] if needed
+        if pixel_values.max() > 1. or  pixel_values.max() < 0.:
+            pixel_values = (pixel_values - pixel_values.min())
+            pixel_values /= pixel_values.max()
+
+        return (pixel_values - self.pixel_mean) / self.pixel_std
+
+    def embeddings(self, x):
+        x = self.encoder.patch_embed(x)
+        x = torch.cat([x, torch.zeros([x.shape[0], 1, x.shape[2]]).to(x.device)], dim=1)
+        return x
+
+    def get_block_groups(self) -> List[nn.Sequential]:
+        """
+        Split transformer blocks into `num_groups` roughly equal groups.
+        Dont forget to pass by:
+            - first inputs go through self.backbone.embeddings(x)
+            - after these blocks outputs fo through self.backbone.layernorm(f_vit)
+        """
+        blocks = list(self.encoder.blocks)
+        num_groups = len(self.layer_indices)
+
+        groups = []
+        groups.append(nn.Sequential(*blocks[0: self.layer_indices[0]+1]))
+        for i in range(num_groups-1):
+            groups.append(nn.Sequential(*blocks[self.layer_indices[i]+1:self.layer_indices[i+1]+1]))
+        return groups
+    def forward(self, x):
+        return x
+
+def vit_adapter_dinov2_small(**kwargs) -> DINOv2FeatureExtractor:
     """ViT-Adapter with DINOv2-S/14 backbone (384-dim, 6 heads)."""
-    defaults = dict(backbone=backbone, num_heads=6)
+    defaults = dict(model_name="dinov2_vits14", layer_indices=kwargs.layer_indices)
     defaults.update(kwargs)
-    return ViTAdapterDINOv2(**defaults)
+    backbone = DINOv2FeatureExtractor(**defaults)
+    return ViTAdapterDINOv2()
 
 
-def vit_adapter_dinov2_base(**kwargs) -> ViTAdapterDINOv2:
+def vit_adapter_dinov2_base(**kwargs) -> DINOv2FeatureExtractor:
     """ViT-Adapter with DINOv2-B/14 backbone (768-dim, 12 heads)."""
-    defaults = dict(model_name="dinov2_vitb14", num_heads=12)
-    defaults.update(kwargs)
-    return ViTAdapterDINOv2(**defaults)
+    defaults = dict(model_name="dinov2_vitb14", layer_indices=kwargs['layer_indices'])
+    backbone = DINOv2FeatureExtractor(**defaults)
+
+    return ViTAdapterDINOv2(
+        backbone=backbone,
+        image_size=kwargs['image_size'],
+    )
 
 
-def vit_adapter_dinov2_large(**kwargs) -> ViTAdapterDINOv2:
+def vit_adapter_dinov2_large(**kwargs) -> DINOv2FeatureExtractor:
     """ViT-Adapter with DINOv2-L/14 backbone (1024-dim, 16 heads)."""
-    defaults = dict(backbone=backbone, num_heads=16)
+    defaults = dict(model_name="dinov2_vitg14")
     defaults.update(kwargs)
-    return ViTAdapterDINOv2(**defaults)
+    print(defaults)
+    return ViTAdapterDINOv2()
 
 
 # ---------------------------------------------------------------------------
@@ -1114,7 +1194,8 @@ if __name__ == "__main__":
 
     # Build model (use small for quick testing)
     print("Building ViT-Adapter with DINOv2-S/14 ...")
-    model = vit_adapter_dinov2_large(
+    model = vit_adapter_dinov2_base(
+        layer_indices=[6,12,18,24],
         num_interactions=4,
         out_channels=256,
         image_size=224
@@ -1129,6 +1210,8 @@ if __name__ == "__main__":
     # Dummy forward pass (DINOv2 patch_size=14, use 224×224)
     dummy = torch.randn(2, 3, 224, 224).to(device)  # 224 = 14 * 16
     print(f"\nInput shape: {dummy.shape}")
+    
+    print(model.backbone.embeddings(dummy).shape)
 
     with torch.no_grad():
         outputs = model(dummy)
