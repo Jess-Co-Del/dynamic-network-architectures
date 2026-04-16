@@ -81,6 +81,7 @@ from transformers import AutoModel
 from dynamic_network_architectures.building_blocks.vit_adapter_probes import *
 from dynamic_network_architectures.building_blocks.mask2formerdecoder import Mask2Former, Mask2FormerDecoderHF
 from dynamic_network_architectures.building_blocks.unetr_decoder import UNETRDecoder, UNETRFPNDecoder
+from dynamic_network_architectures.building_blocks.segformer_decoder import SegFormerDecoder
 from dynamic_network_architectures.building_blocks.upernet_decoder import UPerNetDecoder
 from dynamic_network_architectures.building_blocks.vitadapter import ViTAdapterDINOv2
 
@@ -484,6 +485,12 @@ def build_segmenter(
             image_size=image_size,
         ),
         "unetrfpn": lambda: UNETRFPNDecoder(
+            input_channels=1,
+            hidden_dim=hidden_dim,
+            image_size=image_size,
+            num_classes=num_classes,
+        ),
+        "segformer": lambda: SegFormerDecoder(
             input_channels=1,
             hidden_dim=hidden_dim,
             image_size=image_size,
