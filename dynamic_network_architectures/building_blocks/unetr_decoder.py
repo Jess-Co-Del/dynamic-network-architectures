@@ -1,18 +1,11 @@
 """
-UNETR Decoder for Frozen ViT Backbones (2D Slice-Wise Liver Tumor Segmentation)
+UNETR Decoders
 =================================================================================
-Adapts the UNETR architecture (Hatamizadeh et al., WACV 2022) to work with
-same-resolution patch tokens from frozen ViT backbones (e.g. DINOv2, I-JEPA,
-SigLIP) that lack hierarchical spatial downsampling.
+Implementations of the UNETR architecture (Hatamizadeh et al., WACV 2022) to work
+with 1) same-resolution patch tokens from frozen ViT backbones (e.g. DINOv2, I-JEPA,
+SigLIP) that lack hierarchical spatial downsampling; and 2) hierarchical resolution
+pyramids at 1/4, 1/8, 1/16 and 1/32 of original resolution.
 
-Key design differences vs. original UNETR:
-  - The ViT produces tokens at a SINGLE resolution (no spatial shrinkage).
-  - We tap intermediate transformer layers {L/4, L/2, 3L/4, L} to recover a
-    pseudo-hierarchy, then upsample each to a 2× finer resolution than the
-    previous stage — giving a proper decoder pyramid.
-  - Each skip connection goes through a "reshape → DeConv" block before being
-    merged with the bottom-up decoder stream.
-  - The final head upsamples to the original image resolution.
 
 Architecture overview (for ViT-L/16, image 512×512):
   ┌─────────────────────────────────────────────────────────────────┐
@@ -134,6 +127,14 @@ class UNETRDecoder(nn.Module):
     """
     UNETR-style decoder for same-resolution ViT features.
 
+    Key design differences vs. original UNETR:
+  - The ViT produces tokens at a SINGLE resolution (no spatial shrinkage).
+  - We upsample each to a 2× finer resolution than the
+    previous stage — giving a proper decoder pyramid.
+  - Each skip connection goes through a "reshape → DeConv" block before being
+    merged with the bottom-up decoder stream.
+  - The final head upsamples to the original image resolution.
+
     Args:
         embed_dim   : ViT hidden dimension (e.g. 768 for ViT-B, 1024 for ViT-L).
         patch_size  : ViT patch size in pixels (e.g. 14 for DINOv2, 16 for I-JEPA).
@@ -249,13 +250,13 @@ class UNETRDecoder(nn.Module):
     # ------------------------------------------------------------------
     def forward(
         self,
-        layer_tokens: List[torch.Tensor],
+        features: List[torch.Tensor],
         inputs: torch.Tensor,
         image_hw: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
         """
         Args:
-            layer_tokens : list of  4 tensors [B, hidden_dim, grid_h, grid_w], one per ViT layer.
+            features : list of  4 tensors [B, hidden_dim, grid_h, grid_w], one per ViT layer.
             image_hw     : target output (H, W). Defaults to self.image_size.
         Returns:
             logits [B, num_classes, H, W]
@@ -266,7 +267,7 @@ class UNETRDecoder(nn.Module):
             image_hw = self.image_size
 
         # ── select the four tapped layers ─────────────────────────────────
-        z0, z1, z2, z3 = layer_tokens
+        z0, z1, z2, z3 = features
 
         # ── project tokens → spatial feature maps ─────────────────────────
         s0 = self.skip_projs[0](z0)   # [B, F, gh, gw]
@@ -322,8 +323,6 @@ class UNETRFPNDecoder(nn.Module):
  
     Args
     ----
-    in_channels     : Channel count of *each* FPN level (must be the same
-                      for all four levels after your neck/adapter projection).
     input_channels  : Channels of the raw image input (typically 3 for RGB).
     image_size      : int or (H, W). Used as the default upsample target.
     num_classes     : Segmentation output classes.
@@ -514,7 +513,7 @@ class UNETRFPNDecoder(nn.Module):
         x      = self.dropout(x)
         logits = self.head(x)   # (B, num_classes, H, W)
         return logits
- 
+
     # ─────────────────────────────────────────────────────────────────────
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
