@@ -235,21 +235,28 @@ class DINOv2FeatureExtractor(nn.Module):
 
     # Expose sub-sequences of blocks so the adapter can interleave
     # Prepared for interleaved layer input injection
-    def get_block_groups(self) -> List[nn.Sequential]:
+    def get_block_groups(self, split: str = 'config') -> List[nn.Sequential]:
         """
         Split transformer blocks into `num_groups` roughly equal groups.
         Dont forget to pass by:
             - first inputs go through self.backbone.embeddings(x)
             - after these blocks outputs fo through self.backbone.layernorm(f_vit)
+        Parameters
+        ----------
+        split : ('config' | 'all')
+            Decide which blocks to return.
         """
         blocks = list(self.backbone.encoder.layer)
-        num_groups = len(self.layer_indices)
+        if split == 'all':
+            return blocks
+        else:
+            num_groups = len(self.layer_indices)
 
-        groups = []
-        groups.append(nn.Sequential(*blocks[0: self.layer_indices[0]+1]))
-        for i in range(num_groups-1):
-            groups.append(nn.Sequential(*blocks[self.layer_indices[i]+1:self.layer_indices[i+1]+1]))
-        return groups
+            groups = []
+            groups.append(nn.Sequential(*blocks[0: self.layer_indices[0]+1]))
+            for i in range(num_groups-1):
+                groups.append(nn.Sequential(*blocks[self.layer_indices[i]+1:self.layer_indices[i+1]+1]))
+            return groups
 
 # =============================================================================
 # 3. FULL SEGMENTATION MODEL (wrapper)

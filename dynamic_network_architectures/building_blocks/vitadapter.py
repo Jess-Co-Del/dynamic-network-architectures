@@ -1079,7 +1079,6 @@ class ViTAdapterDINOv2(nn.Module):
 # ---------------------------------------------------------------------------
 # Convenience constructors
 # ---------------------------------------------------------------------------
-from transformers import AutoModel
 
 class DINOv2FeatureExtractor(nn.Module):
     def __init__(
