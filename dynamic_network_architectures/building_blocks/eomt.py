@@ -57,7 +57,7 @@ Usage example
         freeze_backbone=True,
     )
     model = EoMT(
-        encoder=extractor,
+        backbone=extractor,
         num_classes=2,        # liver + tumour (background handled separately)
         num_queries=100,
         num_query_groups=2,   # last 2 block groups become query-aware
@@ -202,26 +202,36 @@ class EoMTBlock(nn.Module):
 
         # Resolve projections robustly across HF versions
         if hasattr(hf_block, "attn"):
-                attn = hf_block.attn
+            attn = hf_block.attn.query
+            D = attn.qkv.weight.shape[0]
+            self.D = D
+            #self.qkv =# nn.Linear(D, 3 * D, bias=True)
+            with torch.no_grad():
+                self.qkv = attn.qkv
+            # Output projection
+            self.out_proj = attn.proj
+
         else:
-            attn = hf_block.attention
-        # Build a fused QKV projection for efficiency
-        if hasattr(attn, "query"):
-            attn = attn.query
-        D = attn.qkv.weight.shape[0]
-        self.D = D
-        #self.qkv =# nn.Linear(D, 3 * D, bias=True)
-        with torch.no_grad():
-            self.qkv = attn.qkv
-        # Output projection
-        self.out_proj = attn.proj
+            attn = hf_block.attention.attention
+            # Build a fused QKV projection for efficiency
+            D = attn.query.weight.shape[0]
+            self.D = D
+            self.qkv = nn.Linear(D, 3 * D, bias=True)
+            with torch.no_grad():
+                self.qkv.weight.copy_(
+                    torch.cat([attn.query.weight, attn.key.weight, attn.value.weight], dim=0)
+                )
+                self.qkv.bias.copy_(
+                    torch.cat([attn.query.bias, attn.key.bias, attn.value.bias], dim=0)
+                )
+            # Output projection
+            self.out_proj = hf_block.attention.output.dense
 
     def _get_norms_and_scales(self):
-        b = self.block
-        norm1 = b.norm1
-        norm2 = b.norm2
-        ls1 = getattr(b, "layer_scale", None)
-        ls2 = getattr(b, "layer_scale2", None)
+        norm1 = self.block.norm1
+        norm2 = self.block.norm2
+        ls1 = getattr(self.block, "layer_scale1", None)
+        ls2 = getattr(self.block, "layer_scale2", None)
         return norm1, norm2, ls1, ls2
 
     def forward(
@@ -230,6 +240,11 @@ class EoMTBlock(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
+        Identical structure to a Dinov2Layer Module, but
+        applies an altered attention mask, performing self and cross attention
+        between tokens and query tokens.
+        https://github.com/huggingface/transformers/blob/v5.6.2/src/transformers/models/dinov2/modeling_dinov2.py
+
         Parameters
         ----------
         x        : (B, N, D)  — N = num_patches [+ num_queries]
@@ -250,13 +265,15 @@ class EoMTBlock(nn.Module):
         )
         if ls1 is not None:
             attn_out = ls1(attn_out)
-        x = residual + attn_out
+        residual = residual + attn_out
 
         # --- MLP sub-layer (unchanged from original block) ---
-        residual = x
-        mlp_out = self.block.mlp(norm2(x))
+        #residual = x
+        mlp_out = self.block.mlp(norm2(residual))
+
         if ls2 is not None:
             mlp_out = ls2(mlp_out)
+
         x = residual + mlp_out
 
         return x
@@ -300,7 +317,7 @@ class EoMT(nn.Module):
 
     def __init__(
         self,
-        encoder,                    # DINOv2FeatureExtractor instance
+        backbone,                    # Backbone instance
         num_classes: int = 2,
         num_queries: int = 2,
         num_query_groups: int = 2,
@@ -308,11 +325,12 @@ class EoMT(nn.Module):
         mask_ratio: float = 1.0,
         upscale_factor: int = 4,
         num_heads: int = 6,
-        return_dict: bool = False
+        return_dict: bool = False,
+        num_register_tokens: int = 1
     ) -> None:
         super().__init__()
 
-        self.encoder = encoder
+        self.encoder = backbone
         self.num_classes = num_classes
         self.num_queries = num_queries
         self.num_query_groups = num_query_groups
@@ -321,11 +339,11 @@ class EoMT(nn.Module):
         self.upscale_factor = upscale_factor
         self.return_dict = return_dict
 
-        D = encoder.hidden_dim
-        num_heads = encoder.backbone.num_heads
+        D = backbone.hidden_dim
+        num_heads = backbone.backbone.config.num_attention_heads
         self.num_heads = num_heads
-        self.patch_size = encoder.patch_size
-        self.num_register_tokens = encoder.backbone.num_register_tokens
+        self.patch_size = backbone.patch_size
+        self.num_register_tokens = num_register_tokens
 
         # ── Learnable queries ────────────────────────────────────────────
         self.q = nn.Embedding(num_queries, D)
@@ -356,7 +374,7 @@ class EoMT(nn.Module):
 
         # ── Wrap last num_query_groups block groups with EoMT blocks ─────
         # get_block_groups() returns Sequential groups; we need individual blocks
-        block_groups = encoder.get_block_groups('all')  # List[nn.Sequential]
+        block_groups = backbone.get_block_groups('all')  # List[nn.Sequential]
 
         # Image-only groups (run normally via HF model — no change needed)
         num_image_only_groups = len(block_groups) - num_query_groups
@@ -377,7 +395,7 @@ class EoMT(nn.Module):
 
         # LayerNorm from backbone (applied after all blocks)
         self.layernorm = nn.LayerNorm(D, eps=1e-8)
-        self.final_norm = encoder.backbone.layernorm
+        self.final_norm = backbone.backbone.layernorm
 
     # ── Mask-annealing API ───────────────────────────────────────────────
 
@@ -675,23 +693,24 @@ if __name__ == "__main__":
     print("Running EoMT smoke test …")
 
     # Minimal mock of DINOv2FeatureExtractor for CPU testing
+    from transformers import AutoModel
 
     class DINOv2FeatureExtractor(nn.Module):
         def __init__(
             self,
-            model_name: str = 'dinov2_vits14',
+            model_name: str = 'facebook/dinov2-large',
             layer_indices: list = [5,12,18,24],
             freeze_backbone: bool = True
         ):
             super().__init__()
-            self.encoder = torch.hub.load('facebookresearch/dinov2', model_name)
-            self.layer_indices = layer_indices
+            self.backbone = AutoModel.from_pretrained(model_name, output_hidden_states=True)
             if freeze_backbone:
-                for param in self.encoder.parameters():
+                for param in self.backbone.parameters():
                     param.requires_grad = False
 
-            self.patch_size: int = self.encoder.patch_size
-            self.hidden_dim: int = self.encoder.embed_dim
+            self.patch_size: int = self.backbone.config.patch_size
+            self.hidden_dim: int = self.backbone.config.hidden_size
+            self.num_layers: int = self.backbone.config.num_hidden_layers
             self.layernorm = nn.LayerNorm(self.hidden_dim)
 
             self.register_buffer(
@@ -702,9 +721,7 @@ if __name__ == "__main__":
                 "pixel_std",
                 torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
             )
-            self.backbone = self.encoder
-            self.backbone.embeddings = partial(self.embeddings)
-            self.backbone.layernorm = partial(self.layernorm)
+
             self.backbone.num_register_tokens = 1
 
         def _preprocess(self, pixel_values: torch.Tensor) -> torch.Tensor:
@@ -729,7 +746,7 @@ if __name__ == "__main__":
             return (pixel_values - self.pixel_mean) / self.pixel_std
 
         def embeddings(self, x):
-            x = self.encoder.patch_embed(x)
+            x = self.backbone.patch_embed(x)
             # Torch hub does not come with CLS token
             x = torch.cat([x, torch.zeros([x.shape[0], 1, x.shape[2]]).to(x.device)], dim=1)
             return x
@@ -741,7 +758,7 @@ if __name__ == "__main__":
                 - first inputs go through self.backbone.embeddings(x)
                 - after these blocks outputs fo through self.backbone.layernorm(f_vit)
             """
-            blocks = list(self.encoder.blocks)
+            blocks = list(self.backbone.encoder.layer)
             if split == 'all':
                 return blocks
             else:
@@ -757,12 +774,13 @@ if __name__ == "__main__":
 
     extractor = DINOv2FeatureExtractor()
     model = EoMT(
-        encoder=extractor,
+        backbone=extractor,
         num_classes=2,
         num_queries=100,
         num_query_groups=3,
         mask_annealing=True,
         mask_ratio=0.05,
+        num_register_tokens=1
     )
     model.eval()
 

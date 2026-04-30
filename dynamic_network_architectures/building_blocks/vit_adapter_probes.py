@@ -91,7 +91,7 @@ class LinearDecoder(nn.Module):
         #self.bn = nn.BatchNorm2d(hidden_dim)
         #self.classifier = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
 
-    def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
+    def forward(self, features: List[torch.Tensor], inputs: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Parameters
         ----------

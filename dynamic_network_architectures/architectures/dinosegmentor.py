@@ -84,6 +84,7 @@ from dynamic_network_architectures.building_blocks.unetr_decoder import UNETRDec
 from dynamic_network_architectures.building_blocks.segformer_decoder import SegFormerDecoder
 from dynamic_network_architectures.building_blocks.upernet_decoder import UPerNetDecoder
 from dynamic_network_architectures.building_blocks.vitadapter import ViTAdapterDINOv2
+from dynamic_network_architectures.building_blocks.eomt import EoMT
 
 # =============================================================================
 # 1. FEATURE EXTRACTOR — wraps HuggingFace DINOv2 and returns intermediate maps
@@ -323,8 +324,6 @@ class DINOv2Segmenter(nn.Module):
         if self.adapter is not None:
             logits = self.adapter(logits)  # (B, num_classes, h', w')
 
-        logits = [scale.to(torch.float32) for scale in logits]
-
         if self.linear_probe:
             # Upsample logits to the original image resolution
             target_size = self.image_size or pixel_values.shape[2:]
@@ -410,6 +409,15 @@ def build_segmenter(
             out_channels=256,
             image_size=image_size
         )
+    elif adapter_type == 'eomt':
+        extractor = EoMT(
+            backbone=extractor,
+            num_classes=num_classes,
+            num_queries=num_classes,
+            num_heads=16,  # For ViT 1024
+            upscale_factor=4,
+            mask_ratio=0.5,
+        )
 
     adapter_map = {
         "linear": lambda: LinearDecoder(
@@ -461,10 +469,14 @@ def build_segmenter(
             **decoder_kwargs,
         ),
         "none": None,
-        "vitadapter": None
+        "vitadapter": None,
+        "eomt": None
     }
 
     decoder_map = {
+        "linear": lambda: LinearDecoder(
+            hidden_dim=hidden_dim
+        ),
         "mask2former": lambda: Mask2Former(
             hidden_dim=hidden_dim,
             num_classes=num_classes,
@@ -511,7 +523,7 @@ def build_segmenter(
             f"Unknown decoder_type '{adapter_map}'. "
             f"Choose from: {list(adapter_map.keys())}"
         )
-    elif adapter_type in ['none', 'vitadapter']:
+    elif adapter_type in ['none', 'vitadapter', 'eomt']:
         adapter = None
     else:
         adapter = adapter_map[adapter_type]()
