@@ -12,6 +12,30 @@ from torch import nn
 from torch.autograd import Function
 from torch.cuda.amp import custom_fwd
 from torch.nn.init import constant_, xavier_uniform_
+from torch.autograd.function import once_differentiable
+from kernels import get_kernel
+
+kernel_module = get_kernel("kernels-community/deformable-detr")
+
+
+class MSDeformAttnFunction(Function):
+    @staticmethod
+    def forward(ctx, value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, im2col_step):
+        ctx.im2col_step = im2col_step
+        output = kernel_module.ms_deform_attn_forward(
+            value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, ctx.im2col_step)
+        ctx.save_for_backward(value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights)
+        return output
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights = ctx.saved_tensors
+        grad_value, grad_sampling_loc, grad_attn_weight = \
+            kernel_module.ms_deform_attn_backward(
+                value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, grad_output, ctx.im2col_step)
+
+        return grad_value, None, None, grad_sampling_loc, grad_attn_weight, None
 
 
 def _is_power_of_2(n):
@@ -22,7 +46,8 @@ def _is_power_of_2(n):
 
 class MSDeformAttn(nn.Module):
     def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4, ratio=1.0):
-        """Multi-Scale Deformable Attention Module.
+        """
+        Multi-Scale Deformable Attention Module.
 
         :param d_model      hidden dimension
         :param n_levels     number of feature levels
@@ -31,7 +56,9 @@ class MSDeformAttn(nn.Module):
         """
         super().__init__()
         if d_model % n_heads != 0:
-            raise ValueError("d_model must be divisible by n_heads, " "but got {} and {}".format(d_model, n_heads))
+            raise ValueError(
+                "d_model must be divisible by n_heads, " "but got {} and {}".format(d_model, n_heads)
+            )
         _d_per_head = d_model // n_heads
         # you'd better set _d_per_head to a power of 2
         # which is more efficient in our CUDA implementation
@@ -49,6 +76,7 @@ class MSDeformAttn(nn.Module):
         self.n_heads = n_heads
         self.n_points = n_points
         self.ratio = ratio
+
         self.sampling_offsets = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
         self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
         self.value_proj = nn.Linear(d_model, int(d_model * ratio))
@@ -117,7 +145,7 @@ class MSDeformAttn(nn.Module):
         sampling_offsets = self.sampling_offsets(query).view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
         attention_weights = self.attention_weights(query).view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
         attention_weights = F.softmax(attention_weights, -1).view(N, Len_q, self.n_heads, self.n_levels, self.n_points)
-
+        # reference_points -> N, Len_q, n_heads, n_levels, n_points, 2
         if reference_points.shape[-1] == 2:
             offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
             sampling_locations = (
@@ -133,12 +161,18 @@ class MSDeformAttn(nn.Module):
             raise ValueError(
                 "Last dim of reference_points must be 2 or 4, but get {} instead.".format(reference_points.shape[-1])
             )
-        output = multi_scale_deformable_attention(
-            value,
-            input_spatial_shapes,
-            sampling_locations,
-            attention_weights,
-        )
+
+        # for amp
+        if value.dtype == torch.float16:
+            # for mixed precision
+            output = MSDeformAttnFunction.apply(
+            value.to(torch.float32), input_spatial_shapes, input_level_start_index, sampling_locations.to(torch.float32), attention_weights, self.im2col_step)
+            output = output.to(torch.float16)
+
+        else:
+            output = MSDeformAttnFunction.apply(
+                value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
+
         output = self.output_proj(output)
         return output
 
