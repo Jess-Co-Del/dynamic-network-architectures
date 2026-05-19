@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.autograd import Function
-from torch.cuda.amp import custom_fwd
+from torch.amp import custom_fwd
 from torch.nn.init import constant_, xavier_uniform_
 from torch.autograd.function import once_differentiable
 from kernels import get_kernel
@@ -21,10 +21,13 @@ kernel_module = get_kernel("kernels-community/deformable-detr")
 class MSDeformAttnFunction(Function):
     @staticmethod
     def forward(ctx, value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, im2col_step):
-        ctx.im2col_step = im2col_step
         output = kernel_module.ms_deform_attn_forward(
-            value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, ctx.im2col_step)
+            value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, im2col_step)
+
+        # This saves all the fowards tensors, and variables necessary
+        ctx.im2col_step = im2col_step
         ctx.save_for_backward(value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights)
+
         return output
 
     @staticmethod
@@ -166,18 +169,22 @@ class MSDeformAttn(nn.Module):
         if value.dtype == torch.float16:
             # for mixed precision
             output = MSDeformAttnFunction.apply(
-            value.to(torch.float32), input_spatial_shapes, input_level_start_index, sampling_locations.to(torch.float32), attention_weights, self.im2col_step)
+                value.to(torch.float32), input_spatial_shapes, input_level_start_index,
+                sampling_locations.to(torch.float32), attention_weights, self.im2col_step
+            )
             output = output.to(torch.float16)
 
         else:
             output = MSDeformAttnFunction.apply(
-                value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
+                value, input_spatial_shapes, input_level_start_index,
+                sampling_locations, attention_weights, self.im2col_step
+            )
 
         output = self.output_proj(output)
         return output
 
 
-@custom_fwd(cast_inputs=torch.float32)
+@custom_fwd(cast_inputs=torch.float32, device_type='cuda')
 def multi_scale_deformable_attention(
         value: torch.Tensor,
         value_spatial_shapes: torch.Tensor,

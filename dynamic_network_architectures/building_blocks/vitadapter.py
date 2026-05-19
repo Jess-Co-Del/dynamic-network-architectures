@@ -638,6 +638,7 @@ class InteractionBlockWithCls(nn.Module):
         dim,
         num_heads=6,
         n_points=4,
+        n_levels=3,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
         drop=0.0,
         drop_path=0.0,
@@ -652,7 +653,7 @@ class InteractionBlockWithCls(nn.Module):
 
         self.injector = Injector(
             dim=dim,
-            n_levels=3,
+            n_levels=n_levels,
             num_heads=num_heads,
             init_values=init_values,
             n_points=n_points,
@@ -660,6 +661,7 @@ class InteractionBlockWithCls(nn.Module):
             deform_ratio=deform_ratio,
             with_cp=with_cp,
         )
+
         self.extractor = Extractor(
             dim=dim,
             n_levels=1,
