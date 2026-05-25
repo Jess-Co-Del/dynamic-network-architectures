@@ -46,6 +46,7 @@ class IJEPALinearSegHead(nn.Module):
     Forward pass output shape: [B, num_classes, image_size, image_size]
 
     Args:
+        input_channels:   Number of input channels.
         num_classes:   Number of semantic classes (e.g. 150 for ADE20K).
         image_size:    Input image spatial resolution (assumed square).
         patch_size:    ViT patch size (16 for vitg16).
@@ -96,18 +97,19 @@ class IJEPALinearSegHead(nn.Module):
         """
         B = pixel_values.shape[0]
 
+        pixel_values = torch.tile(pixel_values, (1,3,1,1)) # [B, 3, H, W], H=W=224
         # ── 1. Run I-JEPA encoder ─────────────────────────────────────────
-        outputs      = self.backbone(pixel_values=pixel_values)
-        # last_hidden_state: [B, 197, 1408]  (197 = 1 CLS + 196 patches)
+        outputs = self.backbone(pixel_values=pixel_values)
+        # last_hidden_state: [B, 196, 1408]  (197 = 196 patches)
 
-        # ── 2. Drop CLS token, reshape to spatial grid ───────────────────
-        patch_tokens = outputs.last_hidden_state  # [:, 1:, :]         # [B, 196, 1408]
+        # ── 2. Reshape to spatial grid ───────────────────
+        patch_tokens = outputs.last_hidden_state  # [:, 1:, :]   # [B, 196, 1408]
         x = (patch_tokens
-             .permute(0, 2, 1)                                     # [B, 1408, 196]
-             .reshape(B, -1, self.grid_size, self.grid_size))       # [B, 1408, 14, 14]
+             .permute(0, 2, 1)                                   # [B, 1408, 196]
+             .reshape(B, -1, self.grid_size, self.grid_size)) # [B, 1408, 14, 14]
 
         # ── 3. Apply segmentation head ────────────────────────────────────
-        x = self.seg_head(x)                                        # [B, num_classes, 14, 14]
+        x = self.seg_head(x)                           # [B, num_classes, 14, 14]
 
         # ── 4. Bilinear upsample to input resolution ──────────────────────
         x = F.interpolate(
