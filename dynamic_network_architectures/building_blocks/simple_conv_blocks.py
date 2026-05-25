@@ -8,6 +8,30 @@ from torch.nn.modules.dropout import _DropoutNd
 
 from dynamic_network_architectures.building_blocks.helper import maybe_convert_scalar_to_list
 
+# ---- Shared utility blocks ----
+
+class ConvBNReLU(nn.Module):
+    """
+    Conv2d → BatchNorm → ReLU (a ubiquitous building block).
+    """
+    def __init__(
+        self,
+        in_ch: int, out_ch: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: int = 0,
+        bias=True
+    ):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size, stride=stride, padding=padding, bias=bias),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
 
 def conv_relu(conv_op: nn.Conv2d, in_channels: int , out_channels: int , kernel: int, padding:int):
     return nn.Sequential(
