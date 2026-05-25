@@ -97,8 +97,8 @@ class MSDeformAttn(nn.Module):
 
         :return output                     (N, Length_{query}, C)
         """
-        # print(query.shape)
-        # print(reference_points.shape)
+        #print(query.shape)
+        #print(reference_points.shape)
         # print(input_flatten.shape)
         # print(input_spatial_shapes.shape)
         # print(input_level_start_index.shape)
@@ -152,7 +152,8 @@ def multi_scale_deformable_attention(
 ) -> torch.Tensor:
     batch_size, _, num_heads, hidden_dim = value.shape
     _, num_queries, num_heads, num_levels, num_points, _ = sampling_locations.shape
-    value_list = value.split([height.item() * width.item() for height, width in value_spatial_shapes], dim=1)
+    value_list = value.split([H_ * W_ for H_, W_ in value_spatial_shapes], dim=1)
+    #value_list = value.split([height.item() * width.item() for height, width in value_spatial_shapes], dim=1)
     sampling_grids = 2 * sampling_locations - 1
     sampling_value_list = []
     for level_id, (height, width) in enumerate(value_spatial_shapes):

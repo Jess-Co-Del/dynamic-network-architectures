@@ -83,7 +83,7 @@ from dynamic_network_architectures.building_blocks.mask2formerdecoder import Mas
 from dynamic_network_architectures.building_blocks.unetr_decoder import UNETRDecoder, UNETRFPNDecoder
 from dynamic_network_architectures.building_blocks.segformer_decoder import SegFormerDecoder
 from dynamic_network_architectures.building_blocks.upernet_decoder import UPerNetDecoder
-from dynamic_network_architectures.building_blocks.vitadapter import ViTAdapterDINOv2
+from dynamic_network_architectures.building_blocks.vitadapter import ViTAdapter
 
 # =============================================================================
 # 1. FEATURE EXTRACTOR — wraps HuggingFace DINOv2 and returns intermediate maps
@@ -231,7 +231,7 @@ class DINOv2FeatureExtractor(nn.Module):
             feat = patch_tokens.permute(0, 2, 1).reshape(B, -1, h, w)
             features.append(feat)
 
-        return features, h, w
+        return features
 
     # Expose sub-sequences of blocks so the adapter can interleave
     # Prepared for interleaved layer input injection
@@ -249,7 +249,11 @@ class DINOv2FeatureExtractor(nn.Module):
         groups.append(nn.Sequential(*blocks[0: self.layer_indices[0]+1]))
         for i in range(num_groups-1):
             groups.append(nn.Sequential(*blocks[self.layer_indices[i]+1:self.layer_indices[i+1]+1]))
-        return groups
+
+        final_groups = nn.Sequential(
+            self.backbone.layernorm
+        )
+        return groups, final_groups
 
 # =============================================================================
 # 3. FULL SEGMENTATION MODEL (wrapper)
@@ -311,7 +315,7 @@ class DINOv2Segmenter(nn.Module):
         logits : Tensor (B, num_classes, H, W)
             Upsampled to the original image size if ``image_size`` was set.
         """
-        logits= self.extractor(pixel_values)
+        logits = self.extractor(pixel_values)
 
         if self.adapter is not None:
             logits = self.adapter(logits)  # (B, num_classes, h', w')
@@ -328,6 +332,7 @@ class DINOv2Segmenter(nn.Module):
                     mode="bilinear",
                     align_corners=False,
                 )
+                return self.decoder(logits)
 
         return self.decoder(logits, pixel_values)
 
@@ -395,7 +400,7 @@ def build_segmenter(
 
     # Preparing Adapter 
     if adapter_type == 'vitadapter':
-        extractor = ViTAdapterDINOv2(
+        extractor = ViTAdapter(
             backbone=extractor,
             in_channels=3,
             num_heads=16,  # For ViT 1024
@@ -475,7 +480,7 @@ def build_segmenter(
         "unetr": lambda: UNETRDecoder(
             hidden_dim=hidden_dim,
             num_classes=num_classes,
-            input_channels=1,
+            input_channels=input_channels,
             image_size=image_size,
         ),
         "upernet": lambda: UPerNetDecoder(
@@ -485,13 +490,13 @@ def build_segmenter(
             image_size=image_size,
         ),
         "unetrfpn": lambda: UNETRFPNDecoder(
-            input_channels=1,
+            input_channels=input_channels,
             hidden_dim=hidden_dim,
             image_size=image_size,
             num_classes=num_classes,
         ),
         "segformer": lambda: SegFormerDecoder(
-            input_channels=1,
+            input_channels=input_channels,
             hidden_dim=hidden_dim,
             image_size=image_size,
             num_classes=num_classes,
@@ -562,10 +567,10 @@ if __name__ == "__main__":
 
     dummy = torch.randn(*IMAGE_SHAPE)
     with torch.no_grad():
-        features, h, w = backbone(dummy)
+        features= backbone(dummy)
 
     print(f"\nInput shape : {IMAGE_SHAPE}")
-    print(f"Patch grid  : {h}×{w}  (patch_size=14, input=224)")
+    print(f"Patch grid  : {features[0].shape[-2]}×{features[0].shape[-1]}  (patch_size=14, input=224)")
     print(f"Num features: {len(features)}  each {tuple(features[0].shape)}")
     print(f"Backbone trainable params: {count_trainable_params(backbone):,}  (frozen → 0)\n")
     print(f"{'Decoder':<35} {'Trainable Params':>18}  {'Output Shape'}")
@@ -573,11 +578,12 @@ if __name__ == "__main__":
 
     decoders = {
         "LinearDecoder": LinearDecoder(
-            hidden_dim=HIDDEN_DIM, num_classes=NUM_CLASSES
+            hidden_dim=HIDDEN_DIM
         ),
         "MultiScaleConcatDecoder": MultiScaleConcatDecoder(
-            hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
-            num_classes=NUM_CLASSES, intermediate_dim=256
+            hidden_dim=HIDDEN_DIM,
+            num_layers=NUM_LAYERS,
+            intermediate_dim=256
         ),
         "FPNLikeDecoder": FPNLikeDecoder(
             hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS,
@@ -601,16 +607,58 @@ if __name__ == "__main__":
             input_channels=3,
             image_size=IMAGE_SHAPE[2:],
         ),
+        "SegFormer": SegFormerDecoder(
+            hidden_dim=HIDDEN_DIM,
+            num_classes=NUM_CLASSES,
+            input_channels=3,
+            image_size=IMAGE_SHAPE[2:],
+        ),
+        "UperNet": UPerNetDecoder(
+            hidden_dim=HIDDEN_DIM,
+            num_classes=NUM_CLASSES,
+            image_size=IMAGE_SHAPE[2:],
+        ),
     }
 
     for name, decoder in decoders.items():
         decoder.eval()
         with torch.no_grad():
-            if isinstance(decoder, UNETRDecoder):
+            if isinstance(decoder, (UNETRDecoder, SegFormerDecoder, UPerNetDecoder)):
                 out = decoder(features, dummy)
             else:
                 out = decoder(features)
         n_params = count_trainable_params(decoder)
+        if isinstance(out, list):
+            print(f"  {name:<33} {n_params:>18,}  {[tuple(ot.shape) for ot in out]}")
+        else:
+            print(f"  {name:<33} {n_params:>18,}  {tuple(out.shape)}")
+
+    extractor = ViTAdapter(
+            backbone=backbone,
+            in_channels=3,
+            num_heads=16,  # For ViT 1024
+            num_interactions=4,
+            out_channels=256,
+            image_size=IMAGE_SHAPE[-1],
+            use_cls=False
+        )
+
+    name = 'VitAdapter'
+    out = extractor(dummy)
+    n_params = count_trainable_params(extractor)
+    if isinstance(out, list):
+        print(f"  {name:<33} {n_params:>18,}  {[tuple(ot.shape) for ot in out]}")
+    else:
         print(f"  {name:<33} {n_params:>18,}  {tuple(out.shape)}")
+
+    for name in ['unetrfpn', 'segformer', 'mask2former']:
+        full_model = build_segmenter(adapter_type='vitadapter', decoder_type=name, input_channels=3)
+        with torch.no_grad():
+            out = full_model(dummy)
+            n_params = count_trainable_params(full_model)
+            if isinstance(out, list):
+                print(f"  {name:<33} {n_params:>18,}  {[tuple(ot.shape) for ot in out]}")
+            else:
+                print(f"  {name:<33} {n_params:>18,}  {tuple(out.shape)}")
 
     print("\nAll smoke tests passed ✓")

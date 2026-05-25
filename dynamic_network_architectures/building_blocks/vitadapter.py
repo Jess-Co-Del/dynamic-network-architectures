@@ -23,7 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dynamic_network_architectures.building_blocks.simple_conv_blocks import ConvBNReLU
 from torch.nn.init import normal_
-
+from transformers.models.dinov2.modeling_dinov2 import Dinov2Layer
+from transformers.models.dinov2.modeling_dinov2 import Dinov2Layer
 
 # ---------------------------------------------------------------------------
 # (c) Spatial Prior Module
@@ -608,7 +609,13 @@ class InteractionBlock(nn.Module):
             level_start_index=deform_inputs1[2],
         )
         for idx, blk in enumerate(blocks):
-            x = blk(x, H_toks, W_toks)
+            if isinstance(blk, Dinov2Layer):
+                x = blk(x)
+            elif isinstance(blk, Dinov2Layer):
+                x = blk(x, attention_mask=None)
+            else:
+                x = blk(x, H_toks, W_toks)
+
         c = self.extractor(
             query=c,
             reference_points=deform_inputs2[0],
@@ -808,7 +815,8 @@ class SpatialPriorModule(nn.Module):
             outs = _inner_forward(x)
         return outs
 
-class ViTAdapterDINOv2(nn.Module):
+
+class ViTAdapter(nn.Module):
     """
     Full ViT-Adapter built on top of DINOv2.
 
@@ -862,9 +870,10 @@ class ViTAdapterDINOv2(nn.Module):
         self.norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
 
         # Split backbone blocks into groups
-        self.blocks = nn.ModuleList(
-            self.backbone.get_block_groups()
-        )
+        encode_blocks, final_backbone = self.backbone.get_block_groups()
+        self.blocks, self.final_enc_blocks = nn.ModuleList(
+            encode_blocks
+        ), final_backbone if final_backbone is not None else nn.Identity()
 
         # --- Spatial Prior Module ---
         self.sp_embed = nn.Parameter(torch.zeros(3, hidden_dim))
@@ -952,20 +961,26 @@ class ViTAdapterDINOv2(nn.Module):
         H_toks, W_toks = self.H_toks, self.W_toks
         H_c, W_c = H // 16, W // 16
         deform_inputs1, deform_inputs2 = deform_inputs(x, self.patch_size)
-        
+
         # SPM forward
         c1, c2, c3, c4 = self.spm(x)
         c2, c3, c4 = self._add_level_embed(c2, c3, c4)
         c = torch.cat([c2, c3, c4], dim=1)
 
-        # 1) DINOv2 patch + position embedding + 1st blocks
-        x = self.backbone.backbone.embeddings(x)  # [B, 1+N, D]
+        # 1) MedDinov3 patch + Rope embedding + 1st blocks
+        if hasattr(self.backbone.backbone, 'patch_embed'):
+            x = self.backbone.backbone.patch_embed(x)
+            x = x.flatten(1, 2)
+            #rope_embed = self.backbone.backbone.rope_embed()
+        # 1) Dinov2 and MedSigLip patch + position embedding + 1st blocks
+        elif hasattr(self.backbone.backbone, 'embeddings'):
+            x = self.backbone.backbone.embeddings(x)  # [B, 1+N, D]
 
         bs, n, dim = x.shape
 
         # Interaction
-        cls, x = (x[:, :1, ], x[:, 1:, ])
         outs = list()
+        cls, x = (x[:, :1, ], x[:, 1:, ])
         for i, layer in enumerate(self.interactions):
             if self.use_cls:
                 x, c, cls = layer(
@@ -996,7 +1011,7 @@ class ViTAdapterDINOv2(nn.Module):
                 outs.append(
                     x.transpose(1, 2).view(bs, dim, H_toks, W_toks).contiguous() \
                         if i < self.num_interactions-1 else \
-                    self.backbone.backbone.layernorm(x).transpose(1, 2).view(bs, dim, H_toks, W_toks).contiguous()
+                    self.final_enc_blocks(x).transpose(1, 2).view(bs, dim, H_toks, W_toks).contiguous()
                     )
             else:  # Used on the simplified backbone for tests
                 outs.append(

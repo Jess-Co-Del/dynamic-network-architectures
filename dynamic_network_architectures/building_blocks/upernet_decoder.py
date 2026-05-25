@@ -117,7 +117,7 @@ class PyramidPoolingModule(nn.Module):
  
         # Fuse: original + all pooled branches
         fuse_in = in_ch + hidden * len(pool_sizes)
-        self.fuse = ConvBNReLU(fuse_in, out_ch, kernel_size=3)
+        self.fuse = ConvBNReLU(fuse_in, out_ch, kernel_size=3, padding=1)
  
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         H, W = x.shape[2], x.shape[3]
@@ -252,7 +252,7 @@ class UPerNetDecoder(nn.Module):
         # ── token → spatial projections ───────────────────────────────────
         # All four taps projected to the same C channels before FPN.
         self.token_projs = nn.ModuleList([
-            ConvBNReLU(hidden_dim, C) for _ in range(num_layers)
+            ConvBNReLU(hidden_dim, C, padding=1) for _ in range(num_layers)
         ])
 
         # ── PPM on the deepest tap ─────────────────────────────────────────
@@ -265,7 +265,7 @@ class UPerNetDecoder(nn.Module):
         # ── Fusion head ───────────────────────────────────────────────────
         # Concatenate all 4 FPN outputs → fuse to C channels
         self.fusion_head = nn.Sequential(
-            ConvBNReLU(4 * C, C, kernel_size=3),
+            ConvBNReLU(4 * C, C, kernel_size=3, padding=1),
             nn.Dropout2d(p=dropout) if dropout > 0 else nn.Identity(),
         )
 

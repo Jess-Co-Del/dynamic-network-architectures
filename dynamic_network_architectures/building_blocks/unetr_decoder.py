@@ -222,8 +222,8 @@ class UNETRDecoder(nn.Module):
 
         # Stage 4: Convolve original input 2x, merge with inputs, Convolve 2x
         self.inputconv  = nn.Sequential(
-            ConvBNReLU(input_channels, stage_chs[0]),
-            ConvBNReLU(stage_chs[0], stage_chs[0])
+            ConvBNReLU(input_channels, stage_chs[0], padding=1),
+            ConvBNReLU(stage_chs[0], stage_chs[0], kernel_size=1)
         )
         self.mergefinal  = MergeBlock(stage_chs[0], stage_chs[0], stage_chs[0])
 
@@ -421,7 +421,7 @@ class UNETRFPNDecoder(nn.Module):
         # x is bilinearly upsampled from (H/2, W/2) to (H, W) before merging.
         self.inputconv = nn.Sequential(
             ConvBNReLU(input_channels, chs[0], padding=1),
-            ConvBNReLU(chs[0], chs[0], padding=1),
+            ConvBNReLU(chs[0], chs[0], kernel_size=1),
         )
         self.mergefinal = MergeBlock(chs[0], chs[0], chs[0])
 

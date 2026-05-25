@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment  # Hungarian matching
-
+from transformers import AutoImageProcessor
 from transformers import Mask2FormerConfig
 from transformers.models.mask2former.modeling_mask2former import (
     Mask2FormerPixelDecoder,          # deformable-attention pixel decoder
@@ -222,15 +222,15 @@ class Mask2FormerDecoder(nn.Module):
         """
         
         # Transformer decoder with masked attention
-        transformer_out = self.transformer_decoder(
+        mask2former_output = self.transformer_decoder(
             multi_scale_features=multi_scale_memory,
             mask_features=mask_features,
             output_hidden_states=True,
         )
 
-        mask_logits = transformer_out.masks_queries_logits[-1]  # (B, N,H,W)
+        #mask_logits = transformer_out.masks_queries_logits[-1]  # (B, N,H,W)
 
-        return mask_logits
+        return mask2former_output
 
     @staticmethod
     def _build_attention_mask(pred_mask, target_hw, num_heads, B):
@@ -468,8 +468,6 @@ class Mask2Former(nn.Module):
         hidden_dim:   int = 1,
         num_classes   = 3,
         num_queries   = 3,
-        embed_dim     = 256,
-        freeze_backbone = True,
         image_size    = 224,
         patch_size    = 16,
         deep_supervision: bool = False
@@ -495,6 +493,12 @@ class Mask2Former(nn.Module):
             config, backbone_out_ch=hidden_dim
         )
 
+        # ── Prediction head for classes -──────────────────────────────────
+        # self.class_head = nn.Linear(hidden_dim, num_classes + 1)   # +1 for no-object
+
+        self.image_processor = AutoImageProcessor.from_pretrained(
+            "facebook/mask2former-swin-small-ade-semantic"
+        )
         self.image_size = image_size
         self.grid_size  = image_size // patch_size   # 14
 
@@ -511,36 +515,45 @@ class Mask2Former(nn.Module):
         Returns (training):
             loss, loss_dict
         """
+        #print([output.shape for output in multi_scale])
 
         # ── 1. Pixel decoder → high-res pixel embeddings + memory ────────
         mask_features, decoder_memory = self.pixel_decoder(multi_scale)
 
         # ── 2. Transformer decoder → query embeddings + mask predictions ─
-        mask_logits = self.transformer_decoder(
+        mask2former_output = self.transformer_decoder(
             mask_features, decoder_memory
         )
-                                                                                
+        mask_logits = mask2former_output.masks_queries_logits[-1]
+        #class_logits = self.class_head(mask2former_output.last_hidden_state)
+
         # ── 3. Upsample masks to full image resolution ───────────────────
-        pred_masks_full = F.interpolate(
+        mask_logits_full = F.interpolate(
             mask_logits, size=(self.image_size, self.image_size),
-            mode='bilinear', align_corners=False
-        )   # [B, Q, 224, 224]
+            mode="bilinear", align_corners=False
+        )  # (B, N, H, W)
 
-        return pred_masks_full
+        return mask_logits_full
 
-    @torch.no_grad()
-    def predict_semantic(self, pixel_values):
+    def predict_semantic(self, masks_queries_logits, class_logits):
         """
         Inference helper: collapses queries → per-pixel semantic labels.
         Standard Mask2Former inference procedure.
+        Partially copied from 
+        transformers/models/mask2former/modeling_mask2former.py
         """
-        pred_logits, pred_masks = self.forward(pixel_values)
+        target_size=(self.image_size, self.image_size)
+
         # [B, Q, C+1] × [B, Q, H, W] → [B, C, H, W]
-        mask_probs  = pred_masks.sigmoid()                         # [B, Q, H, W]
-        class_probs = pred_logits.softmax(-1)[..., :-1]            # [B, Q, C] drop no-obj
+        mask_probs  = masks_queries_logits.sigmoid()               # [B, Q, H, W]
+        mask_logits_up = F.interpolate(
+            mask_probs, size=target_size, mode="bilinear", align_corners=False
+        )  # (B, N, H, W)
+        class_probs = class_logits.softmax(-1)[..., :-1]            # [B, Q, C] drop no-obj
         # Weighted sum: each query contributes its class prob × mask prob
-        seg_logits  = torch.einsum('bqc,bqhw->bchw', class_probs, mask_probs)
-        return seg_logits.argmax(dim=1)  # [B, H, W]  — per-pixel class index
+        seg_logits  = torch.einsum('bqc,bqhw->bchw', class_probs, mask_logits_up)
+
+        return seg_logits
 
 
 # ─────────────────────────────────────────────────────────────────────────────

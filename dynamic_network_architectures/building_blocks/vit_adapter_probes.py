@@ -797,7 +797,6 @@ class UPerNetConvPUPAdapter(nn.Module):
 
         # Top-down pathway
         for i, factor in zip(range(len(laterals) - 2, -1, -1), range(0, len(laterals))):
-            print(i, [latera.shape for latera in laterals])
             if self.skip_fusion == 'add':
                 laterals[i] = self.upsampling_up[factor](laterals[i]) + \
                     self.upsampling_skips[factor](laterals[i+1])
