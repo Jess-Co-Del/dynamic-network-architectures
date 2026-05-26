@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from dynamic_network_architectures.building_blocks.simple_conv_blocks import ConvBNReLU
 from torch.nn.init import normal_
 from transformers.models.dinov2.modeling_dinov2 import Dinov2Layer
-from transformers.models.dinov2.modeling_dinov2 import Dinov2Layer
+from transformers.models.siglip.modeling_siglip import SiglipEncoderLayer
 
 # ---------------------------------------------------------------------------
 # (c) Spatial Prior Module
@@ -608,10 +608,10 @@ class InteractionBlock(nn.Module):
             spatial_shapes=deform_inputs1[1],
             level_start_index=deform_inputs1[2],
         )
-        for idx, blk in enumerate(blocks):
+        for _, blk in enumerate(blocks):
             if isinstance(blk, Dinov2Layer):
                 x = blk(x)
-            elif isinstance(blk, Dinov2Layer):
+            elif isinstance(blk, SiglipEncoderLayer):
                 x = blk(x, attention_mask=None)
             else:
                 x = blk(x, H_toks, W_toks)
@@ -645,6 +645,7 @@ class InteractionBlockWithCls(nn.Module):
         dim,
         num_heads=6,
         n_points=4,
+        n_levels=3,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
         drop=0.0,
         drop_path=0.0,
@@ -659,7 +660,7 @@ class InteractionBlockWithCls(nn.Module):
 
         self.injector = Injector(
             dim=dim,
-            n_levels=3,
+            n_levels=n_levels,
             num_heads=num_heads,
             init_values=init_values,
             n_points=n_points,
@@ -710,8 +711,13 @@ class InteractionBlockWithCls(nn.Module):
             level_start_index=deform_inputs1[2],
         )
         x = torch.cat((cls, x), dim=1)
-        for idx, blk in enumerate(blocks):
-            x = blk(x)
+        for _, blk in enumerate(blocks):
+            if isinstance(blk, Dinov2Layer):
+                x = blk(x)
+            elif isinstance(blk, SiglipEncoderLayer):
+                x = blk(x, attention_mask=None)
+            else:
+                x = blk(x, H_toks, W_toks)
         cls, x = (
             x[
                 :,
@@ -980,7 +986,7 @@ class ViTAdapter(nn.Module):
 
         # Interaction
         outs = list()
-        cls, x = (x[:, :1, ], x[:, 1:, ])
+        cls, x = (x[:, :1, ], x[:, 1:, ]) if self.use_cls else (None, x)
         for i, layer in enumerate(self.interactions):
             if self.use_cls:
                 x, c, cls = layer(

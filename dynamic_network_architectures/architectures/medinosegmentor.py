@@ -422,11 +422,24 @@ if __name__ == "__main__":
     print(f"Patch grid  : {features[0].shape[-2]}×{features[0].shape[-1]}  (patch_size={backbone.patch_size}, input={IMAGE_SHAPE[-1]})")
     print(f"Num features: {len(features)}  each {tuple(features[0].shape)}")
     print(f"Backbone trainable params: {count_trainable_params(backbone):,}  (frozen → 0)\n")
-    print(f"{'Decoder':<35} {'Trainable Params':>18}  {'Output Shape'}")
+    print(f"{'Mulstiscale Decoders':<35} {'Trainable Params':>18}  {'Output Shape'}")
 
     for name in ['unetrfpn', 'segformer', 'mask2former']:
 
         full_model = build_segmenter(adapter_type='vitadapter', decoder_type=name, input_channels=3)
+
+        features = full_model(dummy)
+        print(f"Num features: {len(features)}  each {tuple(features[0].shape)}")
+        n_params = count_trainable_params(full_model)
+        print(f"  {name:<33} {n_params:>18,}  {tuple(features.shape)}")
+    print("-" * 70)
+
+
+    print(f"{'Plain Decoders':<35} {'Trainable Params':>18}  {'Output Shape'}")
+
+    for name in ['unetr', 'upernet']:
+
+        full_model = build_segmenter(adapter_type='none', decoder_type=name, input_channels=3)
 
         features = full_model(dummy)
         print(f"Num features: {len(features)}  each {tuple(features[0].shape)}")
