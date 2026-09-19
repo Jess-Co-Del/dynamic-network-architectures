@@ -173,7 +173,7 @@ class ConditionalResidualEncoderUNet(nn.Module):
                                        return_skips=True, disable_default_stem=False, stem_channels=stem_channels,
                                        time_embedding_dim=time_embedding_dim)
         self.decoder = ConditionalUNetDecoder(self.encoder, num_classes, n_conv_per_stage_decoder, deep_supervision,
-                                       time_embedding_dim)
+                                       time_embedding_dim=time_embedding_dim)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, image_conditional: torch.Tensor = None):
         # if image_conditional is not None:
@@ -261,7 +261,7 @@ class paper_ConditionalResidualEncoderUNet(nn.Module):
                                        return_skips=True, disable_default_stem=False, stem_channels=stem_channels,
                                        time_embedding_dim=time_embedding_dim)
         self.decoder = ConditionalUNetDecoder(self.encoder, num_classes, n_conv_per_stage_decoder, deep_supervision,
-                                       time_embedding_dim)
+                                       time_embedding_dim=time_embedding_dim)
 
     def forward(self, x: torch.Tensor = None, image_conditional: torch.Tensor = None, ddim: bool = False):
         if ddim:

@@ -73,7 +73,6 @@ class CondBasicBlockD(nn.Module):
         self.conv2 = CondConvDropoutNormReLU(conv_op, output_channels, output_channels, kernel_size, 1, conv_bias, norm_op,
                                          norm_op_kwargs, None, None, None, None,
                                          False, time_embedding_dim)
-        self.temb_fc = nn.Linear(time_embedding_dim, output_channels)
 
         self.nonlin2 = nonlin(**nonlin_kwargs) if nonlin is not None else lambda x: x
 

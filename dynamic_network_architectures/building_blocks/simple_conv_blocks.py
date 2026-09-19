@@ -108,7 +108,8 @@ class CondConvDropoutNormReLU(nn.Module):
             # make dimensions match in 2D or 3D case
             for _ in range(len(x.shape)-len(tembed.shape)):
                 tembed = torch.unsqueeze(tembed, axis=-1)
-            x += tembed
+
+            x = x + tembed
         return x
 
     def compute_conv_feature_map_size(self, input_size):

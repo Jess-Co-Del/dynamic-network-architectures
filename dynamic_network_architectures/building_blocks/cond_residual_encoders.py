@@ -97,7 +97,7 @@ class ConditionalResidualEncoder(nn.Module):
             self.stem = StackedConvBlocks(1, conv_op, input_channels, stem_channels, kernel_sizes[0], 1, conv_bias,
                                           norm_op, norm_op_kwargs, dropout_op, dropout_op_kwargs, nonlin, nonlin_kwargs,
                                           time_embedding_dim=time_embedding_dim,
-                                          block=block)
+                                          block=CondConvDropoutNormReLU)
             input_channels = stem_channels
         else:
             self.stem = None
