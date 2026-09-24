@@ -344,3 +344,92 @@ class paper_ConditionalResidualEncoderUNet(nn.Module):
             time = einops.repeat(time, 't -> t b', b=batch)
             times.append(time)
         return times
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Gated-fusion variant: replaces ConditionalResidualEncoderUNet's fixed elementwise-sum skip fusion with a learned
+# per-stage spatial gate, and stops conditioning the CT (image) encoder on the diffusion timestep.
+# ---------------------------------------------------------------------------------------------------------------
+class SpatialGatedFusion(nn.Module):
+    """Learned, per-stage gated fusion of two feature streams, in place of a fixed elementwise sum.
+
+    Follows the design of ``DualPathResponseFusionAttention`` in ``building_blocks/attention.py`` (two 1x1
+    conv+norm branches -> GELU -> a sigmoid spatial gate derived from both -> the gate modulates one branch ->
+    concat -> project back), but takes ``norm_op``/``norm_op_kwargs`` as constructor arguments instead of that
+    module's hardcoded ``BatchNorm``, so callers conditioning a 3D network trained at a small batch size can pass
+    ``InstanceNorm`` -- BatchNorm's per-batch statistics get noisy at small 3D batch sizes, which is exactly the
+    failure mode nnU-Net's own default to ``InstanceNorm`` exists to avoid.
+
+    ``forward(trunk, gated)``: ``trunk`` is projected and passed through with a fixed activation, never gated --
+    training can't zero out this stream. ``gated`` is spatially modulated by a sigmoid gate computed jointly from
+    both streams, so its contribution can vary by location. The two are concatenated and a final 1x1 conv projects
+    back to ``channels``, so callers don't need to know about the intermediate width.
+    """
+
+    def __init__(self, conv_op: Type[nn.Module], channels: int, norm_op: Type[nn.Module],
+                 norm_op_kwargs: Union[dict, None] = None, reduction: int = 2):
+        super().__init__()
+        norm_op_kwargs = norm_op_kwargs or {}
+        inter_channels = max(channels // reduction, 8)
+
+        self.trunk_proj = nn.Sequential(conv_op(channels, inter_channels, 1, bias=True),
+                                        norm_op(inter_channels, **norm_op_kwargs))
+        self.gated_proj = nn.Sequential(conv_op(channels, inter_channels, 1, bias=False),
+                                        norm_op(inter_channels, **norm_op_kwargs))
+        self.gate = nn.Sequential(conv_op(inter_channels, 1, 1, bias=True), norm_op(1, **norm_op_kwargs),
+                                  nn.Sigmoid())
+        self.act = nn.GELU()
+        self.project_out = conv_op(2 * inter_channels, channels, 1, bias=True)
+
+    def forward(self, trunk: torch.Tensor, gated: torch.Tensor) -> torch.Tensor:
+        n_trunk = self.trunk_proj(trunk)
+        n_trunk_out = self.act(n_trunk)
+        n_gated = self.gated_proj(gated)
+        psi = self.gate(self.act(n_trunk + n_gated))
+        fused_gated = n_gated * psi
+        return self.project_out(torch.cat([n_trunk_out, fused_gated], dim=1))
+
+
+class GatedFusionConditionalResidualEncoderUNet(ConditionalResidualEncoderUNet):
+    """``ConditionalResidualEncoderUNet`` with two changes to how the CT image conditions the noisy-mask stream:
+
+    1. Skip-connection fusion at every resolution stage is a learned ``SpatialGatedFusion`` gate instead of a
+       fixed elementwise sum -- the mask stream (``trunk``) can never be zeroed out by training, while the
+       image's contribution (``gated``) is spatially and adaptively weighted. This matters for conditional
+       diffusion segmentation specifically: early denoising steps have a near-random mask and should lean on the
+       image, late steps have an increasingly accurate mask and should lean less on it -- a fixed 1:1 sum can't
+       express that, a learned gate can.
+    2. The CT (conditioning) encoder receives a constant (``t=0``) timestep embedding instead of the real one:
+       the image is fixed for the whole DDIM sampling trajectory, so its features should be too, and coupling
+       them to ``t`` forces the "same" image to be re-encoded differently, and non-cacheably, at every step. Note
+       this passes a *constant* embedding rather than ``tembed=None``: ``StackedConvBlocks.forward``'s
+       ``tembed is None`` branch (in ``building_blocks/simple_conv_blocks.py``) assumes ``self.convs`` is an
+       ``nn.Sequential``, which only holds for ``block=ConvDropoutNormReLU``; for ``block=CondConvDropoutNormReLU``
+       (what every ``Cond*`` encoder uses) ``self.convs`` is an ``nn.ModuleList``, which isn't callable, so
+       ``tembed=None`` raises there -- a dormant bug, never hit before because every existing caller always
+       passes a real ``tembed``. A constant embedding reaches the same "no real t-dependence" goal through the
+       already-working code path instead.
+
+    Everything else -- both encoders' architecture, the decoder, the mask stream's own time embedding -- is
+    inherited unchanged from ``ConditionalResidualEncoderUNet``.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fusion_gates = nn.ModuleList([
+            SpatialGatedFusion(self.encoder.conv_op, channels, self.encoder.norm_op, self.encoder.norm_op_kwargs)
+            for channels in self.encoder.output_channels
+        ])
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, image_conditional: torch.Tensor = None) -> torch.Tensor:
+        t_emb = self.embed(t)
+        skips = self.encoder(x, t_emb)
+        if image_conditional is not None:
+            const_t_emb = self.embed(torch.zeros_like(t))  # see class docstring: constant, not tembed=None
+            cond_skips = self.conditional_encoder(image_conditional, const_t_emb)
+            skips = [gate(mask_skip, cond_skip)
+                    for gate, mask_skip, cond_skip in zip(self.fusion_gates, skips, cond_skips)]
+        return self.decoder(skips, t_emb)
+
+    # initialize() and compute_conv_feature_map_size() are inherited unchanged from
+    # ConditionalResidualEncoderUNet -- both already work generically over self.encoder/self.decoder.
