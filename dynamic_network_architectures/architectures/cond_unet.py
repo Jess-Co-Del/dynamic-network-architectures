@@ -5,6 +5,8 @@ from dynamic_network_architectures.building_blocks.helper import convert_conv_op
 from dynamic_network_architectures.building_blocks.residual import CondBasicBlockD
 from dynamic_network_architectures.building_blocks.cond_residual_encoders import ConditionalResidualEncoder, CondPlainConvEncoder
 from dynamic_network_architectures.building_blocks.cond_unet_decoder import ConditionalUNetDecoder
+from dynamic_network_architectures.building_blocks.residual_encoders import ResidualEncoder
+from dynamic_network_architectures.building_blocks.unet_decoder import UNetDecoder
 from dynamic_network_architectures.initialization.weight_init import InitWeights_He
 from dynamic_network_architectures.initialization.weight_init import init_last_bn_before_add_to_0
 from torch import nn
@@ -176,9 +178,6 @@ class ConditionalResidualEncoderUNet(nn.Module):
                                        time_embedding_dim=time_embedding_dim)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, image_conditional: torch.Tensor = None):
-        # if image_conditional is not None:
-        #     image_first = torch.cat([image_conditional, x], dim=1)
-
         t_emb = self.embed(t)  # [batch, time_embedding_dim]
 
         skips = self.encoder(x, t_emb)
@@ -197,6 +196,61 @@ class ConditionalResidualEncoderUNet(nn.Module):
     def initialize(module):
         InitWeights_He(1e-2)(module)
         init_last_bn_before_add_to_0(module)
+
+
+class TimeInvariantConditionalResidualEncoderUNet(ConditionalResidualEncoderUNet):
+    """
+    ``ConditionalResidualEncoderUNet`` with the CT (conditioning) encoder replaced entirely by its non-conditional
+    twin, plain ``ResidualEncoder``.
+    """
+
+    def __init__(self,
+        input_channels: int,
+        n_stages: int,
+        features_per_stage: Union[int, List[int], Tuple[int, ...]],
+        conv_op: Type[_ConvNd],
+        kernel_sizes: Union[int, List[int], Tuple[int, ...]],
+        strides: Union[int, List[int], Tuple[int, ...]],
+        n_blocks_per_stage: Union[int, List[int], Tuple[int, ...]],
+        num_classes: int,
+        n_conv_per_stage_decoder: Union[int, Tuple[int, ...], List[int]],
+        conv_bias: bool = False,
+        norm_op: Union[None, Type[nn.Module]] = None,
+        norm_op_kwargs: dict = None,
+        dropout_op: Union[None, Type[_DropoutNd]] = None,
+        dropout_op_kwargs: dict = None,
+        nonlin: Union[None, Type[torch.nn.Module]] = None,
+        nonlin_kwargs: dict = None,
+        deep_supervision: bool = False,
+        block: CondBasicBlockD = CondBasicBlockD,
+        bottleneck_channels: Union[int, List[int], Tuple[int, ...]] = None,
+        stem_channels: int = None,
+        time_embedding_dim: int = 512,
+        conditional_channels: int = None,
+    ):
+        super().__init__(
+            input_channels, n_stages, features_per_stage, conv_op, kernel_sizes, strides, n_blocks_per_stage,
+            num_classes, n_conv_per_stage_decoder, conv_bias, norm_op, norm_op_kwargs, dropout_op,
+            dropout_op_kwargs, nonlin, nonlin_kwargs, deep_supervision, block, bottleneck_channels, stem_channels,
+            time_embedding_dim, conditional_channels)
+        # replace the parent's time-conditioned conditional_encoder with its plain, non-conditional twin -- note
+        # no `block=` (that's CondBasicBlockD, for the Cond* encoders) and no `time_embedding_dim` (ResidualEncoder
+        # doesn't take one), so this genuinely has no time-embedding machinery, not just an unused input to it.
+        self.conditional_encoder = ResidualEncoder(
+            conditional_channels, n_stages, features_per_stage, conv_op, kernel_sizes, strides, n_blocks_per_stage,
+            conv_bias, norm_op, norm_op_kwargs, dropout_op, dropout_op_kwargs, nonlin, nonlin_kwargs,
+            return_skips=True, disable_default_stem=False, stem_channels=stem_channels)
+
+    def _conditional_skips(self, image_conditional: torch.Tensor) -> List[torch.Tensor]:
+        return self.conditional_encoder(image_conditional)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, image_conditional: torch.Tensor = None) -> torch.Tensor:
+        t_emb = self.embed(t)
+        skips = self.encoder(x, t_emb)
+        if image_conditional is not None:
+            cond_skips = self._conditional_skips(image_conditional)
+            skips = [skip_stage + cond_skip_stage for skip_stage, cond_skip_stage in zip(skips, cond_skips)]
+        return self.decoder(skips, t_emb)
 
 
 class paper_ConditionalResidualEncoderUNet(nn.Module):
@@ -390,28 +444,14 @@ class SpatialGatedFusion(nn.Module):
         return self.project_out(torch.cat([n_trunk_out, fused_gated], dim=1))
 
 
-class GatedFusionConditionalResidualEncoderUNet(ConditionalResidualEncoderUNet):
-    """``ConditionalResidualEncoderUNet`` with two changes to how the CT image conditions the noisy-mask stream:
+class GatedFusionConditionalResidualEncoderUNet(TimeInvariantConditionalResidualEncoderUNet):
+    """
+    ``TimeInvariantConditionalResidualEncoderUNet`` (CT encoder decoupled from ``t``) with one further change to
+    how the CT image conditions the noisy-mask stream:
 
-    1. Skip-connection fusion at every resolution stage is a learned ``SpatialGatedFusion`` gate instead of a
-       fixed elementwise sum -- the mask stream (``trunk``) can never be zeroed out by training, while the
-       image's contribution (``gated``) is spatially and adaptively weighted. This matters for conditional
-       diffusion segmentation specifically: early denoising steps have a near-random mask and should lean on the
-       image, late steps have an increasingly accurate mask and should lean less on it -- a fixed 1:1 sum can't
-       express that, a learned gate can.
-    2. The CT (conditioning) encoder receives a constant (``t=0``) timestep embedding instead of the real one:
-       the image is fixed for the whole DDIM sampling trajectory, so its features should be too, and coupling
-       them to ``t`` forces the "same" image to be re-encoded differently, and non-cacheably, at every step. Note
-       this passes a *constant* embedding rather than ``tembed=None``: ``StackedConvBlocks.forward``'s
-       ``tembed is None`` branch (in ``building_blocks/simple_conv_blocks.py``) assumes ``self.convs`` is an
-       ``nn.Sequential``, which only holds for ``block=ConvDropoutNormReLU``; for ``block=CondConvDropoutNormReLU``
-       (what every ``Cond*`` encoder uses) ``self.convs`` is an ``nn.ModuleList``, which isn't callable, so
-       ``tembed=None`` raises there -- a dormant bug, never hit before because every existing caller always
-       passes a real ``tembed``. A constant embedding reaches the same "no real t-dependence" goal through the
-       already-working code path instead.
-
-    Everything else -- both encoders' architecture, the decoder, the mask stream's own time embedding -- is
-    inherited unchanged from ``ConditionalResidualEncoderUNet``.
+    Skip-connection fusion at every resolution stage is a learned ``SpatialGatedFusion`` gate instead of a
+    fixed elementwise sum: the mask stream (``trunk``) can never be zeroed out by training, while the
+    image's contribution (``gated``) is spatially and adaptively weighted.
     """
 
     def __init__(self, *args, **kwargs):
@@ -425,11 +465,72 @@ class GatedFusionConditionalResidualEncoderUNet(ConditionalResidualEncoderUNet):
         t_emb = self.embed(t)
         skips = self.encoder(x, t_emb)
         if image_conditional is not None:
-            const_t_emb = self.embed(torch.zeros_like(t))  # see class docstring: constant, not tembed=None
-            cond_skips = self.conditional_encoder(image_conditional, const_t_emb)
+            cond_skips = self._conditional_skips(image_conditional)
             skips = [gate(mask_skip, cond_skip)
                     for gate, mask_skip, cond_skip in zip(self.fusion_gates, skips, cond_skips)]
         return self.decoder(skips, t_emb)
 
-    # initialize() and compute_conv_feature_map_size() are inherited unchanged from
-    # ConditionalResidualEncoderUNet -- both already work generically over self.encoder/self.decoder.
+
+class ConditionalResidualEncoderDecoderUNet(TimeInvariantConditionalResidualEncoderUNet):
+    """
+    ``TimeInvariantConditionalResidualEncoderUNet`` (CT encoder replaced by the plain, non-conditional
+    ``ResidualEncoder``) extended so the CT (conditioning) branch is a full encoder-*decoder* instead of an
+    encoder alone. ``conditional_decoder`` is correspondingly a plain ``UNetDecoder`` too.
+    """
+
+    def __init__(self,
+        input_channels: int,
+        n_stages: int,
+        features_per_stage: Union[int, List[int], Tuple[int, ...]],
+        conv_op: Type[_ConvNd],
+        kernel_sizes: Union[int, List[int], Tuple[int, ...]],
+        strides: Union[int, List[int], Tuple[int, ...]],
+        n_blocks_per_stage: Union[int, List[int], Tuple[int, ...]],
+        num_classes: int,
+        n_conv_per_stage_decoder: Union[int, Tuple[int, ...], List[int]],
+        conv_bias: bool = False,
+        norm_op: Union[None, Type[nn.Module]] = None,
+        norm_op_kwargs: dict = None,
+        dropout_op: Union[None, Type[_DropoutNd]] = None,
+        dropout_op_kwargs: dict = None,
+        nonlin: Union[None, Type[torch.nn.Module]] = None,
+        nonlin_kwargs: dict = None,
+        deep_supervision: bool = False,
+        block: CondBasicBlockD = CondBasicBlockD,
+        bottleneck_channels: Union[int, List[int], Tuple[int, ...]] = None,
+        stem_channels: int = None,
+        time_embedding_dim: int = 512,
+        conditional_channels: int = None,
+    ):
+        super().__init__(
+            input_channels, n_stages, features_per_stage, conv_op, kernel_sizes, strides, n_blocks_per_stage,
+            num_classes, n_conv_per_stage_decoder, conv_bias, norm_op, norm_op_kwargs, dropout_op,
+            dropout_op_kwargs, nonlin, nonlin_kwargs, deep_supervision, block, bottleneck_channels, stem_channels,
+            time_embedding_dim, conditional_channels)
+        self.conditional_decoder = UNetDecoder(
+            self.conditional_encoder, num_classes, n_conv_per_stage_decoder, deep_supervision=True)
+        # one non-bottleneck stage per encoder stage: project the condition decoder's num_classes-channel output
+        # back up to that stage's feature width before summing it into the mask encoder's skip.
+        self.cond_proj = nn.ModuleList([
+            conv_op(num_classes, channels, 1) for channels in self.encoder.output_channels[:-1]
+        ])
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, image_conditional: torch.Tensor = None) -> torch.Tensor:
+        t_emb = self.embed(t)
+        skips = self.encoder(x, t_emb)
+        if image_conditional is not None:
+            cond_skips = self._conditional_skips(image_conditional)
+            cond_decoder_outputs = self.conditional_decoder(cond_skips)  # deep_supervision=True -> a list
+            fused = []
+            for i, mask_skip in enumerate(skips):
+                if i == len(skips) - 1:
+                    fused.append(mask_skip + cond_skips[i])  # bottleneck: same as TimeInvariantConditional...UNet
+                else:
+                    fused.append(mask_skip + self.cond_proj[i](cond_decoder_outputs[i]))
+            skips = fused
+        return self.decoder(skips, t_emb)
+
+    def compute_conv_feature_map_size(self, input_size):
+        return (super().compute_conv_feature_map_size(input_size)
+                + self.conditional_encoder.compute_conv_feature_map_size(input_size)
+                + self.conditional_decoder.compute_conv_feature_map_size(input_size))
