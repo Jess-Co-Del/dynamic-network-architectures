@@ -42,7 +42,10 @@ class NeuralBandPassFilter(nn.Module):
     def forward(self, freq_feat: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         """``freq_feat``: (B, C, F) real-valued features over F frequency-bin tokens."""
         scale, shift = self.film(t_emb).chunk(2, dim=-1)  # each (B, C)
-        gate = torch.sigmoid(self.gain(freq_feat))
+        # depthwise conv (groups == channels) has incomplete bfloat16 CUDA support in PyTorch, same issue as
+        # AnchorAttention.smooth -- see that class's forward for the full explanation.
+        with torch.autocast(device_type=freq_feat.device.type, enabled=False):
+            gate = torch.sigmoid(self.gain(freq_feat.float()).to(freq_feat.dtype))
         return freq_feat * gate * (1 + scale.unsqueeze(-1)) + shift.unsqueeze(-1)
 
 
@@ -150,7 +153,11 @@ class AnchorAttention(nn.Module):
         self.gate = nn.Sequential(conv_op(num_classes, 1, 1, bias=True), nn.Sigmoid())
 
     def forward(self, anchor_logits: torch.Tensor, diffusion_feat: torch.Tensor) -> torch.Tensor:
-        smoothed = self.smooth(anchor_logits)
+        # depthwise conv (groups == channels) has no bfloat16 CUDA kernel in PyTorch (conv_depthwise3d, the 3D
+        # case this class is actually used with, only supports fp32/fp16) -- training runs under bf16 autocast, so
+        # this one op needs it explicitly disabled and the input/output cast around it, or it crashes on CUDA.
+        with torch.autocast(device_type=anchor_logits.device.type, enabled=False):
+            smoothed = self.smooth(anchor_logits.float()).to(anchor_logits.dtype)
         combined = torch.maximum(smoothed, anchor_logits)
         gate = self.gate(combined)
         return gate * diffusion_feat + diffusion_feat
