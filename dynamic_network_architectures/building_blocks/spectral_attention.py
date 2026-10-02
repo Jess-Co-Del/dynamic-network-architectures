@@ -124,7 +124,7 @@ class SSFormer(nn.Module):
 
         gated = self.band_pass(attended.transpose(1, 2), t_emb).transpose(1, 2)  # (B, N, C)
 
-        ri = self.freq_out(gated)  # (B, N, 2C)
+        ri = self.freq_out(gated).float()  # (B, N, 2C) -- torch.complex doesn't accept bfloat16/float16 at all
         ri = ri.transpose(1, 2).reshape(b, 2 * c, *freq_shape)
         fused_freq = torch.complex(ri[:, :c].contiguous(), ri[:, c:].contiguous())
         fused_spatial = torch.fft.irfftn(fused_freq, s=spatial, dim=spatial_dims, norm="ortho").to(orig_dtype)
